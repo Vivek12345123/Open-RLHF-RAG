@@ -753,4 +753,118 @@ def run_fever_benchmark(model, sample_size: int = 100):
             logger.error(f"Error processing FEVER item {i}: {e}")
             continue
     
-    logger.info(f"
+    (f"Processed {i + 1}/{len(ds)} TriviaQA samples")
+                
+        except Exception as e:
+            logger.error(f"Error processing TriviaQA item {i}: {e}")
+            continue
+    
+    logger.info(f"FEVER benchmark completed with {len(results)} samples")
+    return results
+
+def run_ragbench_benchmark(model, sample_size: int = 100):
+    """RAGbench - RAG-specific benchmark"""
+    logger.info(f"Running RAGbench benchmark with {sample_size} samples...")
+    
+    ragbench_options = [
+        ("ragbench", "validation"),
+        ("RAGbench", "validation"),
+        ("rag-bench", "validation"),
+        ("chen-rag/ragbench", "validation"),
+        ("microsoft/ragbench", "validation")
+    ]
+    
+    ds = load_dataset_with_backup(ragbench_options, sample_size)
+    if ds is None:
+        logger.warning("Failed to load RAGbench - creating synthetic evaluation")
+        return []
+    
+    logger.info(f"Using {len(ds)} samples from RAGbench")
+    results = []
+    
+    for i, item in enumerate(ds):
+        try:
+            question = item.get('question', '')
+            answer = item.get('answer', '')
+            context = item.get('context', '')
+            
+            response = model.think_retrieve_reflect(question)
+            
+            if answer:
+                scores = evaluator.evaluate_multiple_answers(response['text'], [answer])
+            else:
+                scores = {'em': 0.0, 'f1': 0.0}
+            
+            results.append({
+                'dataset': 'ragbench',
+                'question': question,
+                'response': response['text'],
+                'thinking': response.get('thinking', ''),
+                'reflection': response.get('reflection', {}),
+                'ground_truth_answer': answer,
+                'exact_match': scores['em'],
+                'f1_score': scores['f1'],
+                'inference_time': response['inference_time'],
+                'tokens_generated': response['tokens_generated'],
+                'utility_score': response['utility_score'],
+                'is_relevant': response['is_relevant'],
+                'support_level': response['support_level'],
+                'uses_retrieval': response['uses_retrieval'],
+                'num_retrieved_docs': len(response.get('retrieved_docs', []))
+            })
+            
+            if (i + 1) % 10 == 0:
+                logger.info(f"Processed {i + 1}/{len(ds)} RAGbench samples")
+                
+        except Exception as e:
+            logger.error(f"Error processing RAGbench item {i}: {e}")
+            continue
+    
+    logger.info(f"RAGbench benchmark completed with {len(results)} samples")
+    return results
+
+def run_all_benchmarks(model, sample_size: int = 100):
+    """Run all benchmarks and aggregate results"""
+    logger.info("Starting comprehensive TIRESRAG-R1 evaluation...")
+    
+    all_results = []
+    benchmarks = [
+        ("HotpotQA", run_hotpot_qa_benchmark),
+        ("Natural Questions", run_natural_questions_benchmark),
+        ("TriviaQA", run_triviaqa_benchmark),
+        ("SQuAD v2", run_squad_v2_benchmark),
+        ("FEVER", run_fever_benchmark),
+        ("RAGbench", run_ragbench_benchmark)
+    ]
+    
+    for benchmark_name, benchmark_func in benchmarks:
+        try:
+            logger.info(f"Starting {benchmark_name} benchmark...")
+            results = benchmark_func(model, sample_size)
+            all_results.extend(results)
+            logger.info(f"Completed {benchmark_name} with {len(results)} results")
+        except Exception as e:
+            logger.error(f"Error running {benchmark_name} benchmark: {e}")
+            continue
+    
+    return all_results
+
+def main():
+    """Main evaluation function"""
+    model = TIRESRAGModel()
+    sample_size = 100
+    results = run_all_benchmarks(model, sample_size)
+    
+    if not results:
+        logger.error("No results generated from any benchmark")
+        return
+    
+    # Save results
+    with open("tiresrag_evaluation_results.json", 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    
+    logger.info(f"Evaluation completed with {len(results)} total samples")
+    logger.info("Results saved to tiresrag_evaluation_results.json")
+
+if __name__ == "__main__":
+    main()
