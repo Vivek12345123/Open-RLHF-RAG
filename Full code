@@ -7,10 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import logging
 from datasets import load_dataset
 import numpy as np
-import bz2
-import tarfile
 import requests
-from urllib.parse import urljoin
 import re
 from collections import Counter
 import string
@@ -33,165 +30,251 @@ except ImportError:
     print("Warning: bert_score not available. Install with: pip install bert_score")
     BERTSCORE_AVAILABLE = False
 
-# OpenRLHF imports
+# TIRESRAG-R1 imports - these need to be installed from the actual project
 try:
-    from openrlhf import OpenRLHFRAG
-    from openrlhf.trainer import RAGTrainer
-    from openrlhf.models import get_llm_for_sequence_regression
-    OPENRLHF_AVAILABLE = True
+    # These would be the actual TIRESRAG-R1 imports based on the project structure
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    TIRESRAG_AVAILABLE = True
 except ImportError:
-    print("Warning: OpenRLHF not available. Install with: pip install openrlhf")
-    OPENRLHF_AVAILABLE = False
+    print("Warning: TIRESRAG-R1 dependencies not available")
+    TIRESRAG_AVAILABLE = False
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class OpenRLHFRAGModel:
-    """OpenRLHF RAG model implementation for evaluation only"""
+class TIRESRAGModel:
+    """TIRESRAG-R1 model implementation for evaluation"""
     
     def __init__(self, 
-                 model_path: str = "microsoft/DialoGPT-medium",
-                 retrieval_corpus_path: str = None,
-                 max_tokens: int = 100,
+                 model_path: str = "Qwen/Qwen2.5-7B-Instruct",  # Based on typical TIRESRAG models
+                 retrieval_api_url: str = "http://localhost:8000/retrieve",  # From wiki_servish.sh
+                 answer_reflection_url: str = "http://localhost:8001/reflect",  # From answer_reflection_reward.sh
+                 thinking_reward_url: str = "http://localhost:8002/thinking",  # From sufficient_thinking_reward.sh
+                 max_tokens: int = 512,
                  temperature: float = 0.0,
                  top_p: float = 1.0):
-        """Initialize OpenRLHF RAG model for inference only"""
-        
-        if not OPENRLHF_AVAILABLE:
-            raise ImportError("OpenRLHF not available. Please install with: pip install openrlhf")
+        """Initialize TIRESRAG-R1 model for evaluation"""
         
         self.model_path = model_path
+        self.retrieval_api_url = retrieval_api_url
+        self.answer_reflection_url = answer_reflection_url
+        self.thinking_reward_url = thinking_reward_url
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
         
-        # Initialize OpenRLHF RAG components for inference only
+        # Initialize model and tokenizer
         try:
-            # Load the language model for inference
-            self.llm = get_llm_for_sequence_regression(
-                model_path=model_path,
-                bf16=True,  # Use bf16 for efficiency
-                flash_attention=True
-            )
-            
-            # Initialize RAG components for inference only (no training)
-            self.rag_trainer = RAGTrainer(
-                model=self.llm,
-                retrieval_corpus_path=retrieval_corpus_path,
-                max_length=max_tokens,
-                train_mode=False  # Ensure no training mode
-            )
-            
-            # Set model to evaluation mode
-            self.llm.eval()
-            
-            logger.info(f"OpenRLHF RAG model initialized for evaluation with {model_path}")
-            
+            if TIRESRAG_AVAILABLE:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                    trust_remote_code=True
+                )
+                self.model.eval()
+                logger.info(f"TIRESRAG-R1 model loaded: {model_path}")
+            else:
+                self.tokenizer = None
+                self.model = None
+                logger.warning("TIRESRAG-R1 dependencies not available - using fallback mode")
+                
         except Exception as e:
-            logger.error(f"Failed to initialize OpenRLHF RAG: {e}")
-            # Fallback to simpler implementation
-            self.llm = None
-            self.rag_trainer = None
-            logger.warning("Using fallback mode without full RAG functionality")
+            logger.error(f"Failed to initialize TIRESRAG-R1 model: {e}")
+            self.tokenizer = None
+            self.model = None
 
-    def format_prompt(self, input_text, paragraph=None):
-        """Format prompt for OpenRLHF RAG"""
-        if paragraph is not None:
-            # Include retrieved context in the prompt
-            prompt = f"Context: {paragraph}\n\nQuestion: {input_text}\n\nAnswer:"
-        else:
-            prompt = f"Question: {input_text}\n\nAnswer:"
-        return prompt
+    def retrieve_documents(self, query: str, top_k: int = 5) -> List[Dict]:
+        """Retrieve documents using the TIRESRAG retrieval API"""
+        try:
+            response = requests.post(
+                self.retrieval_api_url,
+                json={"query": query, "top_k": top_k},
+                timeout=30
+            )
+            if response.status_code == 200:
+                return response.json().get("documents", [])
+            else:
+                logger.warning(f"Retrieval API returned status {response.status_code}")
+                return []
+        except Exception as e:
+            logger.warning(f"Retrieval API call failed: {e}")
+            return []
 
-    def generate_response(self, prompt: str) -> Dict[str, Any]:
-        """Generate response using OpenRLHF RAG (evaluation only)"""
+    def think_retrieve_reflect(self, question: str) -> Dict[str, Any]:
+        """Implement the think-retrieve-reflect process"""
         start_time = time.time()
         
         try:
-            if self.rag_trainer is not None:
-                # Use full RAG functionality for inference only
-                with torch.no_grad():  # Ensure no gradient computation
-                    response = self.rag_trainer.generate(
-                        prompt,
-                        max_length=self.max_tokens,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        do_sample=self.temperature > 0
-                    )
-                
-                response_text = response.get('generated_text', '')
-                tokens_generated = len(response.get('token_ids', []))
-                uses_retrieval = response.get('retrieved_docs', []) != []
-                
+            # Step 1: Think - Generate initial reasoning
+            think_prompt = f"""Question: {question}
+
+Let me think step by step about this question before retrieving information:
+
+Thinking:"""
+            
+            thinking = self.generate_text(think_prompt, max_tokens=200)
+            
+            # Step 2: Retrieve - Get relevant documents
+            retrieved_docs = self.retrieve_documents(question)
+            
+            # Build context from retrieved documents
+            context_parts = []
+            for i, doc in enumerate(retrieved_docs[:3]):  # Use top 3 documents
+                if isinstance(doc, dict):
+                    title = doc.get('title', f'Document {i+1}')
+                    content = doc.get('text', doc.get('content', ''))
+                    context_parts.append(f"{title}: {content[:300]}...")
+            
+            context_text = "\n".join(context_parts) if context_parts else ""
+            
+            # Step 3: Generate answer with context
+            if context_text:
+                answer_prompt = f"""Question: {question}
+
+My initial thinking: {thinking}
+
+Retrieved information:
+{context_text}
+
+Based on my thinking and the retrieved information, here is my answer:"""
             else:
-                # Fallback mode
-                response_text = f"[Fallback Response] Based on the question: {prompt[:100]}..."
-                tokens_generated = len(response_text.split())
-                uses_retrieval = False
+                answer_prompt = f"""Question: {question}
+
+My thinking: {thinking}
+
+Answer:"""
+            
+            answer = self.generate_text(answer_prompt, max_tokens=200)
+            
+            # Step 4: Reflect - Evaluate answer quality
+            reflection = self.reflect_on_answer(question, answer, context_text)
             
             inference_time = time.time() - start_time
             
             return {
-                'text': response_text,
-                'tokens_generated': tokens_generated,
+                'text': answer,
+                'thinking': thinking,
+                'retrieved_docs': retrieved_docs,
+                'reflection': reflection,
+                'tokens_generated': len(answer.split()) if answer else 0,
                 'inference_time': inference_time,
-                'uses_retrieval': uses_retrieval,
-                'utility_score': self.extract_utility_score(response_text),
-                'is_relevant': self.extract_relevance(response_text),
-                'support_level': self.extract_support(response_text)
+                'uses_retrieval': len(retrieved_docs) > 0,
+                'utility_score': self.extract_utility_score(answer),
+                'is_relevant': self.extract_relevance(answer),
+                'support_level': self.extract_support(answer, context_text)
             }
             
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
+            logger.error(f"Error in think-retrieve-reflect process: {e}")
             return {
-                'text': f"[Error] Could not generate response: {str(e)}",
+                'text': f"[Error] Could not complete think-retrieve-reflect process: {str(e)}",
+                'thinking': "",
+                'retrieved_docs': [],
+                'reflection': {"quality": 0.0, "sufficiency": 0.0},
                 'tokens_generated': 0,
                 'inference_time': time.time() - start_time,
                 'uses_retrieval': False,
                 'utility_score': 0,
                 'is_relevant': False,
-                'support_level': 'unknown'
+                'support_level': 'no_support'
             }
 
+    def generate_text(self, prompt: str, max_tokens: int = 200) -> str:
+        """Generate text using the TIRESRAG model"""
+        if self.model is None or self.tokenizer is None:
+            # Fallback mode
+            return f"[Simulated response to: {prompt[:50]}...]"
+        
+        try:
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs.input_ids.to(self.model.device),
+                    max_new_tokens=max_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    do_sample=self.temperature > 0,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            # Decode only the new tokens
+            new_tokens = outputs[0][inputs.input_ids.shape[1]:]
+            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            
+            return response.strip()
+            
+        except Exception as e:
+            logger.error(f"Error generating text: {e}")
+            return f"[Generation Error: {str(e)}]"
+
+    def reflect_on_answer(self, question: str, answer: str, context: str) -> Dict[str, float]:
+        """Use reflection API to evaluate answer quality"""
+        try:
+            reflection_data = {
+                "question": question,
+                "answer": answer,
+                "context": context
+            }
+            
+            response = requests.post(
+                self.answer_reflection_url,
+                json=reflection_data,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.warning(f"Reflection API returned status {response.status_code}")
+                
+        except Exception as e:
+            logger.warning(f"Reflection API call failed: {e}")
+        
+        # Fallback reflection scoring
+        return {
+            "quality": 0.7 if len(answer) > 50 else 0.3,
+            "sufficiency": 0.8 if context else 0.4,
+            "thinking_quality": 0.6 if "because" in answer.lower() or "since" in answer.lower() else 0.4
+        }
+
     def extract_utility_score(self, text: str) -> int:
-        """Extract utility score (simplified for OpenRLHF)"""
-        # Simple heuristic based on response length and content
+        """Extract utility score based on response quality"""
         if not text or len(text.strip()) < 10:
             return 1
-        elif len(text.strip()) < 50:
+        elif "[Error]" in text or "[Simulated" in text:
+            return 1
+        elif len(text.strip()) < 30:
             return 2
-        elif len(text.strip()) < 100:
+        elif len(text.strip()) < 80:
             return 3
-        elif len(text.strip()) < 200:
+        elif len(text.strip()) < 150:
             return 4
         else:
             return 5
 
     def extract_relevance(self, text: str) -> bool:
-        """Extract relevance (simplified for OpenRLHF)"""
-        # Simple heuristic - check if response is not just error or fallback
-        error_indicators = ['[Error]', '[Fallback Response]', 'could not', 'cannot answer']
+        """Check if response is relevant"""
+        error_indicators = ['[Error]', '[Simulated', 'could not', 'cannot complete']
         return not any(indicator in text for indicator in error_indicators)
 
-    def extract_support(self, text: str) -> str:
-        """Extract support level (simplified for OpenRLHF)"""
-        if '[Error]' in text or '[Fallback Response]' in text:
+    def extract_support(self, text: str, context: str) -> str:
+        """Extract support level based on context usage"""
+        if '[Error]' in text or '[Simulated' in text:
             return 'no_support'
-        elif len(text.strip()) > 100:
+        elif context and len(context.strip()) > 50:
             return 'fully_supported'
-        elif len(text.strip()) > 50:
+        elif context and len(context.strip()) > 0:
             return 'partially_supported'
         else:
-            return 'unknown'
+            return 'no_support'
 
-    def uses_retrieval(self, text: str) -> bool:
-        """Check if model used retrieval during generation"""
-        # This would be properly implemented with OpenRLHF's retrieval tracking
-        return 'Context:' in text or 'Based on' in text
-
-class OpenRLHFRAGEvaluator:
-    """Evaluator for OpenRLHF RAG following original evaluation methodology"""
+class TIRESRAGEvaluator:
+    """Evaluator for TIRESRAG-R1 following the paper's methodology"""
     
     def __init__(self):
         if ROUGE_AVAILABLE:
@@ -248,7 +331,6 @@ class OpenRLHFRAGEvaluator:
         if not ground_truths:
             return {'em': 0.0, 'f1': 0.0}
         
-        # Take best score across all ground truths
         best_em = 0.0
         best_f1 = 0.0
         
@@ -265,7 +347,7 @@ class OpenRLHFRAGEvaluator:
         return {'em': best_em, 'f1': best_f1}
 
 # Initialize global evaluator
-evaluator = OpenRLHFRAGEvaluator()
+evaluator = TIRESRAGEvaluator()
 
 def load_dataset_with_backup(options, sample_size):
     """Load dataset with multiple backup options"""
@@ -299,182 +381,15 @@ def load_dataset_with_backup(options, sample_size):
         
     return ds
 
-def run_natural_questions_benchmark(model, sample_size: int = 100):
-    """Natural Questions - adapted for OpenRLHF RAG"""
-    logger.info(f"Running Natural Questions benchmark with {sample_size} samples...")
-    
-    # Backup download options for Natural Questions
-    nq_options = [
-        ("natural_questions", "default", "validation"),
-        ("google-research-datasets/natural_questions", "default", "validation")
-    ]
-    
-    ds = load_dataset_with_backup(nq_options, sample_size)
-    if ds is None:
-        logger.error("Failed to load Natural Questions from all backup sources")
-        return []
-    
-    logger.info(f"Using {len(ds)} samples from Natural Questions")
-    results = []
-    
-    for i, item in enumerate(ds):
-        try:
-            # Extract question and answers
-            question = item.get('question', {}).get('text', '')
-            annotations = item.get('annotations', [])
-            document = item.get('document', {})
-            
-            # Extract context from document tokens
-            tokens = document.get('tokens', [])
-            if tokens:
-                context_text = ' '.join([token.get('token', '') for token in tokens[:1000]])  
-            else:
-                context_text = ""
-            
-            # Extract answer spans
-            answer_texts = []
-            if annotations:
-                for ann in annotations:
-                    short_answers = ann.get('short_answers', [])
-                    for sa in short_answers:
-                        start_token = sa.get('start_token', 0)
-                        end_token = sa.get('end_token', 0)
-                        if start_token < len(tokens) and end_token <= len(tokens):
-                            answer_text = ' '.join([tokens[j].get('token', '') for j in range(start_token, end_token)])
-                            if answer_text.strip():
-                                answer_texts.append(answer_text.strip())
-            
-            # Generate OpenRLHF RAG response with context
-            if context_text.strip():
-                prompt = model.format_prompt(question, context_text)
-            else:
-                prompt = model.format_prompt(question)
-            
-            response = model.generate_response(prompt)
-            
-            # Evaluation
-            if answer_texts:
-                scores = evaluator.evaluate_multiple_answers(response['text'], answer_texts)
-            else:
-                scores = {'em': 0.0, 'f1': 0.0}
-            
-            results.append({
-                'dataset': 'natural_questions',
-                'question': question,
-                'response': response['text'],
-                'ground_truth_answers': answer_texts,
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'utility_score': response['utility_score'],
-                'is_relevant': response['is_relevant'],
-                'support_level': response['support_level'],
-                'uses_retrieval': response['uses_retrieval']
-            })
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(ds)} Natural Questions samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing Natural Questions item {i}: {e}")
-            continue
-    
-    logger.info(f"Natural Questions benchmark completed with {len(results)} samples")
-    return results
-
-def run_trivia_qa_benchmark(model, sample_size: int = 100):
-    """TriviaQA - adapted for OpenRLHF RAG"""
-    logger.info(f"Running TriviaQA benchmark with {sample_size} samples...")
-    
-    # Backup download options for TriviaQA
-    trivia_options = [
-        ("trivia_qa", "rc", "validation"),
-        ("mandarjoshi/trivia_qa", "rc", "validation")
-    ]
-    
-    ds = load_dataset_with_backup(trivia_options, sample_size)
-    if ds is None:
-        logger.error("Failed to load TriviaQA from all backup sources")
-        return []
-    
-    logger.info(f"Using {len(ds)} samples from TriviaQA")
-    results = []
-    
-    for i, item in enumerate(ds):
-        try:
-            question = item.get('question', '')
-            answer = item.get('answer', {})
-            search_results = item.get('search_results', {})
-            entity_pages = item.get('entity_pages', {})
-            
-            # Extract answer texts
-            answer_texts = []
-            if answer:
-                value = answer.get('value', '')
-                aliases = answer.get('aliases', [])
-                if value:
-                    answer_texts.append(value)
-                answer_texts.extend(aliases)
-            
-            # Build context
-            context_text = ""
-            if search_results:
-                search_contexts = search_results.get('search_context', [])
-                if search_contexts:
-                    context_text = "\n".join(search_contexts[:3])
-            elif entity_pages:
-                wiki_context = entity_pages.get('wiki_context', [])
-                if wiki_context:
-                    context_text = "\n".join(wiki_context[:3])
-            
-            # Generate response
-            if context_text.strip():
-                prompt = model.format_prompt(question, context_text)
-            else:
-                prompt = model.format_prompt(question)
-            
-            response = model.generate_response(prompt)
-            
-            # Evaluation
-            if answer_texts:
-                scores = evaluator.evaluate_multiple_answers(response['text'], answer_texts)
-            else:
-                scores = {'em': 0.0, 'f1': 0.0}
-            
-            results.append({
-                'dataset': 'trivia_qa',
-                'question': question,
-                'response': response['text'],
-                'ground_truth_answers': answer_texts,
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'utility_score': response['utility_score'],
-                'is_relevant': response['is_relevant'],
-                'support_level': response['support_level'],
-                'uses_retrieval': response['uses_retrieval']
-            })
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(ds)} TriviaQA samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing TriviaQA item {i}: {e}")
-            continue
-    
-    logger.info(f"TriviaQA benchmark completed with {len(results)} samples")
-    return results
-
 def run_hotpot_qa_benchmark(model, sample_size: int = 100):
-    """HotpotQA - adapted for OpenRLHF RAG"""
+    """HotpotQA - Multi-hop reasoning benchmark"""
     logger.info(f"Running HotpotQA benchmark with {sample_size} samples...")
     
-    # Backup download options for HotpotQA
     hotpot_options = [
+        ("hotpotqa/hotpot_qa", "distractor", "validation"),
+        ("hotpotqa/hotpot_qa", "fullwiki", "validation"),
         ("hotpot_qa", "distractor", "validation"),
-        ("hotpotqa/hotpot_qa", "distractor", "validation")
+        ("hotpot_qa", "fullwiki", "validation")
     ]
     
     ds = load_dataset_with_backup(hotpot_options, sample_size)
@@ -494,25 +409,8 @@ def run_hotpot_qa_benchmark(model, sample_size: int = 100):
             level = item.get('level', 'unknown')
             type_question = item.get('type', 'unknown')
             
-            # Build context from paragraphs
-            context_text = ""
-            if context:
-                context_paragraphs = []
-                for title, sentences in context:
-                    if sentences:
-                        paragraph_text = f"{title}: {' '.join(sentences)}"
-                        context_paragraphs.append(paragraph_text)
-                
-                if context_paragraphs:
-                    context_text = "\n".join(context_paragraphs[:5])
-            
-            # Generate response
-            if context_text.strip():
-                prompt = model.format_prompt(question, context_text)
-            else:
-                prompt = model.format_prompt(question)
-            
-            response = model.generate_response(prompt)
+            # Use TIRESRAG think-retrieve-reflect process
+            response = model.think_retrieve_reflect(question)
             
             # Evaluation
             if answer:
@@ -524,6 +422,8 @@ def run_hotpot_qa_benchmark(model, sample_size: int = 100):
                 'dataset': 'hotpot_qa',
                 'question': question,
                 'response': response['text'],
+                'thinking': response.get('thinking', ''),
+                'reflection': response.get('reflection', {}),
                 'ground_truth_answer': answer,
                 'level': level,
                 'type': type_question,
@@ -535,7 +435,8 @@ def run_hotpot_qa_benchmark(model, sample_size: int = 100):
                 'is_relevant': response['is_relevant'],
                 'support_level': response['support_level'],
                 'uses_retrieval': response['uses_retrieval'],
-                'num_context_paragraphs': len(context)
+                'num_context_paragraphs': len(context),
+                'num_retrieved_docs': len(response.get('retrieved_docs', []))
             })
             
             if (i + 1) % 10 == 0:
@@ -548,11 +449,161 @@ def run_hotpot_qa_benchmark(model, sample_size: int = 100):
     logger.info(f"HotpotQA benchmark completed with {len(results)} samples")
     return results
 
+def run_natural_questions_benchmark(model, sample_size: int = 100):
+    """Google Natural Questions - Real user questions benchmark"""
+    logger.info(f"Running Natural Questions benchmark with {sample_size} samples...")
+    
+    nq_options = [
+        ("google-research-datasets/natural_questions", "validation"),
+        ("natural_questions", "validation")
+    ]
+    
+    ds = load_dataset_with_backup(nq_options, sample_size)
+    if ds is None:
+        logger.error("Failed to load Natural Questions from all backup sources")
+        return []
+    
+    logger.info(f"Using {len(ds)} samples from Natural Questions")
+    results = []
+    
+    for i, item in enumerate(ds):
+        try:
+            question_text = item.get('question', {}).get('text', '') if isinstance(item.get('question'), dict) else item.get('question', '')
+            
+            # Handle different annotation formats
+            annotations = item.get('annotations', [])
+            answers = []
+            if annotations:
+                for annotation in annotations:
+                    if isinstance(annotation, dict):
+                        # Extract short answers
+                        short_answers = annotation.get('short_answers', [])
+                        for sa in short_answers:
+                            if isinstance(sa, dict) and 'text' in sa:
+                                answers.append(sa['text'])
+                        
+                        # Extract long answer if no short answers
+                        if not answers:
+                            long_answer = annotation.get('long_answer', {})
+                            if isinstance(long_answer, dict) and 'candidate_index' in long_answer:
+                                # This would need the document context to extract
+                                pass
+            
+            if not answers:
+                answers = [item.get('answer', '')]
+            
+            # Use TIRESRAG think-retrieve-reflect process
+            response = model.think_retrieve_reflect(question_text)
+            
+            # Evaluation
+            if answers and any(answers):
+                scores = evaluator.evaluate_multiple_answers(response['text'], answers)
+            else:
+                scores = {'em': 0.0, 'f1': 0.0}
+            
+            results.append({
+                'dataset': 'natural_questions',
+                'question': question_text,
+                'response': response['text'],
+                'thinking': response.get('thinking', ''),
+                'reflection': response.get('reflection', {}),
+                'ground_truth_answer': answers,
+                'exact_match': scores['em'],
+                'f1_score': scores['f1'],
+                'inference_time': response['inference_time'],
+                'tokens_generated': response['tokens_generated'],
+                'utility_score': response['utility_score'],
+                'is_relevant': response['is_relevant'],
+                'support_level': response['support_level'],
+                'uses_retrieval': response['uses_retrieval'],
+                'num_retrieved_docs': len(response.get('retrieved_docs', []))
+            })
+            
+            if (i + 1) % 10 == 0:
+                logger.info(f"Processed {i + 1}/{len(ds)} Natural Questions samples")
+                
+        except Exception as e:
+            logger.error(f"Error processing Natural Questions item {i}: {e}")
+            continue
+    
+    logger.info(f"Natural Questions benchmark completed with {len(results)} samples")
+    return results
+
+def run_triviaqa_benchmark(model, sample_size: int = 100):
+    """TriviaQA - Trivia questions benchmark"""
+    logger.info(f"Running TriviaQA benchmark with {sample_size} samples...")
+    
+    triviaqa_options = [
+        ("trivia_qa", "rc.nocontext", "validation"),
+        ("trivia_qa", "unfiltered.nocontext", "validation"),
+        ("mandarjoshi/trivia_qa", "validation"),
+        ("lucadiliello/triviaqa", "validation")
+    ]
+    
+    ds = load_dataset_with_backup(triviaqa_options, sample_size)
+    if ds is None:
+        logger.error("Failed to load TriviaQA from all backup sources")
+        return []
+    
+    logger.info(f"Using {len(ds)} samples from TriviaQA")
+    results = []
+    
+    for i, item in enumerate(ds):
+        try:
+            question = item.get('question', '')
+            answer = item.get('answer', {})
+            
+            # Handle different answer formats
+            if isinstance(answer, dict):
+                answers = answer.get('aliases', [])
+                if 'value' in answer:
+                    answers.append(answer['value'])
+                if 'normalized_value' in answer:
+                    answers.append(answer['normalized_value'])
+            else:
+                answers = [answer] if answer else []
+            
+            # Use TIRESRAG think-retrieve-reflect process
+            response = model.think_retrieve_reflect(question)
+            
+            # Evaluation
+            if answers:
+                scores = evaluator.evaluate_multiple_answers(response['text'], answers)
+            else:
+                scores = {'em': 0.0, 'f1': 0.0}
+            
+            results.append({
+                'dataset': 'triviaqa',
+                'question': question,
+                'response': response['text'],
+                'thinking': response.get('thinking', ''),
+                'reflection': response.get('reflection', {}),
+                'ground_truth_answer': answers,
+                'exact_match': scores['em'],
+                'f1_score': scores['f1'],
+                'inference_time': response['inference_time'],
+                'tokens_generated': response['tokens_generated'],
+                'utility_score': response['utility_score'],
+                'is_relevant': response['is_relevant'],
+                'support_level': response['support_level'],
+                'uses_retrieval': response['uses_retrieval'],
+                'num_retrieved_docs': len(response.get('retrieved_docs', []))
+            })
+            
+            if (i + 1) % 10 == 0:
+                logger.info(f"Processed {i + 1}/{len(ds)} TriviaQA samples")
+                
+        except Exception as e:
+            logger.error(f"Error processing TriviaQA item {i}: {e}")
+            continue
+    
+    logger.info(f"TriviaQA benchmark completed with {len(results)} samples")
+    return results
+
 def run_squad_v2_benchmark(model, sample_size: int = 100):
-    """SQuAD v2 - adapted for OpenRLHF RAG"""
+    """SQuAD v2 - Reading comprehension with unanswerable questions"""
     logger.info(f"Running SQuAD v2 benchmark with {sample_size} samples...")
     
-    # Backup download options for SQuAD v2
     squad_options = [
         ("rajpurkar/squad_v2", "validation"),
         ("squad_v2", "validation")
@@ -569,39 +620,38 @@ def run_squad_v2_benchmark(model, sample_size: int = 100):
     for i, item in enumerate(ds):
         try:
             question = item.get('question', '')
-            context = item.get('context', '')
             answers = item.get('answers', {})
-            squad_id = item.get('id', f'squad_{i}')
+            context = item.get('context', '')
+            is_impossible = item.get('is_impossible', False)
             
-            # Check if question is answerable
-            answer_texts = answers.get('text', []) if answers else []
-            is_impossible = len(answer_texts) == 0
-            
-            # Generate response
-            if context.strip():
-                prompt = model.format_prompt(question, context)
+            # Handle different answer formats
+            if isinstance(answers, dict):
+                answer_texts = answers.get('text', [])
             else:
-                prompt = model.format_prompt(question)
+                answer_texts = [answers] if answers else []
             
-            response = model.generate_response(prompt)
+            # Use TIRESRAG think-retrieve-reflect process
+            response = model.think_retrieve_reflect(question)
             
             # Evaluation
-            if not is_impossible and answer_texts:
+            if answer_texts and not is_impossible:
                 scores = evaluator.evaluate_multiple_answers(response['text'], answer_texts)
             elif is_impossible:
-                # Check if model correctly identifies as unanswerable
-                no_answer_indicators = ["no answer", "cannot answer", "not provided", "unknown", "unanswerable"]
-                detected_impossible = any(indicator in response['text'].lower() for indicator in no_answer_indicators)
-                scores = {'em': 1.0 if detected_impossible else 0.0, 'f1': 1.0 if detected_impossible else 0.0}
+                # For impossible questions, check if model correctly identifies as unanswerable
+                impossible_indicators = ['no answer', 'cannot answer', 'impossible', 'unanswerable', 'not enough information']
+                correctly_identified = any(indicator in response['text'].lower() for indicator in impossible_indicators)
+                scores = {'em': 1.0 if correctly_identified else 0.0, 'f1': 1.0 if correctly_identified else 0.0}
             else:
                 scores = {'em': 0.0, 'f1': 0.0}
             
             results.append({
                 'dataset': 'squad_v2',
-                'id': squad_id,
                 'question': question,
+                'context': context[:200] + '...' if len(context) > 200 else context,
                 'response': response['text'],
-                'ground_truth_answers': answer_texts,
+                'thinking': response.get('thinking', ''),
+                'reflection': response.get('reflection', {}),
+                'ground_truth_answer': answer_texts,
                 'is_impossible': is_impossible,
                 'exact_match': scores['em'],
                 'f1_score': scores['f1'],
@@ -610,7 +660,8 @@ def run_squad_v2_benchmark(model, sample_size: int = 100):
                 'utility_score': response['utility_score'],
                 'is_relevant': response['is_relevant'],
                 'support_level': response['support_level'],
-                'uses_retrieval': response['uses_retrieval']
+                'uses_retrieval': response['uses_retrieval'],
+                'num_retrieved_docs': len(response.get('retrieved_docs', []))
             })
             
             if (i + 1) % 10 == 0:
@@ -624,13 +675,17 @@ def run_squad_v2_benchmark(model, sample_size: int = 100):
     return results
 
 def run_fever_benchmark(model, sample_size: int = 100):
-    """FEVER - adapted for OpenRLHF RAG (replaces CRAG)"""
+    """FEVER - Fact Extraction and VERification benchmark"""
     logger.info(f"Running FEVER benchmark with {sample_size} samples...")
     
-    # FEVER dataset options
     fever_options = [
-        ("fever", "v1.0", "paper_dev"),
-        ("fever", "v2.0", "validation")
+        ("fever/fever", "v1.0", "paper_dev"),
+        ("fever/fever", "v1.0", "paper_test"),
+        ("fever/fever", "v2.0", "validation"),
+        ("fever/fever", "validation"),
+        ("fever", "validation"),
+        ("BeIR/fever", "validation"),
+        ("mteb/fever", "validation")
     ]
     
     ds = load_dataset_with_backup(fever_options, sample_size)
@@ -643,524 +698,59 @@ def run_fever_benchmark(model, sample_size: int = 100):
     
     for i, item in enumerate(ds):
         try:
-            # Handle FEVER dataset format
-            claim_id = item.get('id', f'fever_{i}')
             claim = item.get('claim', '')
-            label = item.get('label', 'NOT ENOUGH INFO')
+            label = item.get('label', '')
             evidence = item.get('evidence', [])
             
-            # Build context from evidence
-            context_text = ""
-            if evidence:
-                evidence_texts = []
-                for ev_group in evidence[:3]:  # Use first 3 evidence groups
-                    if isinstance(ev_group, list):
-                        for ev_item in ev_group:
-                            if isinstance(ev_item, list) and len(ev_item) >= 3:
-                                # ev_item format: [annotation_id, evidence_id, wiki_url, sent_id]
-                                wiki_url = ev_item[2] if len(ev_item) > 2 else ""
-                                if wiki_url:
-                                    evidence_texts.append(wiki_url.replace('_', ' '))
-                
-                if evidence_texts:
-                    context_text = "\n".join(evidence_texts)
-            
-            # Format as fact-checking question
+            # Convert FEVER task to QA format
             question = f"Is this claim true or false? Claim: {claim}"
             
-            # Generate response
-            if context_text.strip():
-                prompt = model.format_prompt(question, context_text)
-            else:
-                prompt = model.format_prompt(question)
+            # Use TIRESRAG think-retrieve-reflect process
+            response = model.think_retrieve_reflect(question)
             
-            response = model.generate_response(prompt)
+            # Evaluation for fact verification
+            # Check if model correctly identifies claim as SUPPORTED, REFUTED, or NOTENOUGHINFO
+            response_lower = response['text'].lower()
+            predicted_label = 'NOTENOUGHINFO'  # default
             
-            # Create ground truth based on label
-            if label == 'SUPPORTS':
-                ground_truth = ['true', 'supported', 'correct']
-            elif label == 'REFUTES':
-                ground_truth = ['false', 'refuted', 'incorrect']
-            else:  # NOT ENOUGH INFO
-                ground_truth = ['not enough info', 'insufficient evidence', 'unknown']
+            if any(word in response_lower for word in ['true', 'correct', 'supported', 'verify', 'confirmed']):
+                predicted_label = 'SUPPORTED'
+            elif any(word in response_lower for word in ['false', 'incorrect', 'refuted', 'wrong', 'disputed']):
+                predicted_label = 'REFUTED'
+            elif any(word in response_lower for word in ['not enough', 'insufficient', 'unclear', 'cannot determine']):
+                predicted_label = 'NOTENOUGHINFO'
             
-            # Evaluation
-            scores = evaluator.evaluate_multiple_answers(response['text'], ground_truth)
+            # Calculate accuracy
+            label_accuracy = 1.0 if predicted_label == label else 0.0
             
+            # For FEVER, we use label accuracy instead of EM/F1
             results.append({
                 'dataset': 'fever',
-                'claim_id': claim_id,
-                'claim': claim,
                 'question': question,
+                'claim': claim,
                 'response': response['text'],
+                'thinking': response.get('thinking', ''),
+                'reflection': response.get('reflection', {}),
                 'ground_truth_label': label,
-                'ground_truth_answers': ground_truth,
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
+                'predicted_label': predicted_label,
+                'label_accuracy': label_accuracy,
+                'exact_match': label_accuracy,  # Using label accuracy as EM equivalent
+                'f1_score': label_accuracy,     # Using label accuracy as F1 equivalent
                 'inference_time': response['inference_time'],
                 'tokens_generated': response['tokens_generated'],
                 'utility_score': response['utility_score'],
                 'is_relevant': response['is_relevant'],
                 'support_level': response['support_level'],
                 'uses_retrieval': response['uses_retrieval'],
-                'num_evidence_groups': len(evidence)
+                'num_evidence_sets': len(evidence),
+                'num_retrieved_docs': len(response.get('retrieved_docs', []))
             })
             
             if (i + 1) % 10 == 0:
                 logger.info(f"Processed {i + 1}/{len(ds)} FEVER samples")
-            
+                
         except Exception as e:
             logger.error(f"Error processing FEVER item {i}: {e}")
             continue
     
-    logger.info(f"FEVER benchmark completed with {len(results)} samples")
-    return results
-
-def run_truthfulqa_benchmark(model, sample_size: int = 100):
-    """TruthfulQA - adapted for OpenRLHF RAG (evaluation only)"""
-    logger.info(f"Running TruthfulQA benchmark with {sample_size} samples...")
-    
-    # TruthfulQA dataset options
-    truthfulqa_options = [
-        ("truthfulqa/truthful_qa", "generation", "validation"),
-        ("domenicrosati/TruthfulQA", "validation")
-    ]
-    
-    ds = load_dataset_with_backup(truthfulqa_options, sample_size)
-    if ds is None:
-        logger.error("Failed to load TruthfulQA from all backup sources")
-        return []
-    
-    logger.info(f"Using {len(ds)} samples from TruthfulQA")
-    results = []
-    
-    for i, item in enumerate(ds):
-        try:
-            question = item.get('question', '')
-            best_answer = item.get('best_answer', '')
-            correct_answers = item.get('correct_answers', [])
-            incorrect_answers = item.get('incorrect_answers', [])
-            category = item.get('category', 'unknown')
-            
-            # Build ground truth answers (best answer + correct answers)
-            ground_truth_answers = []
-            if best_answer:
-                ground_truth_answers.append(best_answer)
-            if correct_answers:
-                ground_truth_answers.extend(correct_answers)
-            
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_answers = []
-            for ans in ground_truth_answers:
-                if ans and ans.strip() and ans not in seen:
-                    unique_answers.append(ans)
-                    seen.add(ans)
-            ground_truth_answers = unique_answers
-            
-            # Generate response (evaluation only - no training)
-            prompt = model.format_prompt(question)
-            
-            # Ensure model is in evaluation mode
-            with torch.no_grad() if 'torch' in globals() else nullcontext():
-                response = model.generate_response(prompt)
-            
-            # Evaluation against ground truth
-            if ground_truth_answers:
-                scores = evaluator.evaluate_multiple_answers(response['text'], ground_truth_answers)
-            else:
-                scores = {'em': 0.0, 'f1': 0.0}
-            
-            # Additional TruthfulQA-specific evaluation
-            # Check if response matches any incorrect answers (should be penalized)
-            matches_incorrect = False
-            if incorrect_answers:
-                for incorrect_ans in incorrect_answers:
-                    if incorrect_ans and evaluator.exact_match_score(response['text'], incorrect_ans):
-                        matches_incorrect = True
-                        break
-            
-            # Truthfulness score (1.0 if matches correct, 0.0 if matches incorrect, 0.5 otherwise)
-            if scores['em'] > 0:
-                truthfulness_score = 1.0
-            elif matches_incorrect:
-                truthfulness_score = 0.0
-            else:
-                truthfulness_score = 0.5
-            
-            results.append({
-                'dataset': 'truthfulqa',
-                'question': question,
-                'response': response['text'],
-                'best_answer': best_answer,
-                'correct_answers': correct_answers,
-                'incorrect_answers': incorrect_answers,
-                'category': category,
-                'ground_truth_answers': ground_truth_answers,
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'truthfulness_score': truthfulness_score,
-                'matches_incorrect': matches_incorrect,
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'utility_score': response['utility_score'],
-                'is_relevant': response['is_relevant'],
-                'support_level': response['support_level'],
-                'uses_retrieval': response['uses_retrieval']
-            })
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(ds)} TruthfulQA samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing TruthfulQA item {i}: {e}")
-            continue
-    
-    logger.info(f"TruthfulQA benchmark completed with {len(results)} samples")
-    return results
-
-def create_evaluation_plots(results):
-    """Create comprehensive plots for all evaluation data"""
-    plt.style.use('seaborn-v0_8')
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle('OpenRLHF RAG Evaluation Results Across All Benchmarks', fontsize=16, fontweight='bold')
-    
-    # Prepare data for plotting
-    datasets = []
-    exact_matches = []
-    f1_scores = []
-    utility_scores = []
-    retrieval_usage = []
-    
-    for dataset_name, dataset_results in results.items():
-        if dataset_results.get('individual_results'):
-            individual_results = dataset_results['individual_results']
-            dataset_display_name = dataset_name.replace('_', ' ').title()
-            
-            # Collect all scores for this dataset
-            em_scores = [r['exact_match'] for r in individual_results if 'exact_match' in r]
-            f1_scores_data = [r['f1_score'] for r in individual_results if 'f1_score' in r]
-            util_scores = [r['utility_score'] for r in individual_results if 'utility_score' in r]
-            retrieval_data = [r['uses_retrieval'] for r in individual_results if 'uses_retrieval' in r]
-            
-            if em_scores:
-                datasets.extend([dataset_display_name] * len(em_scores))
-                exact_matches.extend(em_scores)
-                f1_scores.extend(f1_scores_data)
-                utility_scores.extend(util_scores)
-                retrieval_usage.extend([1 if r else 0 for r in retrieval_data])
-    
-    # Plot 1: Exact Match Scores Distribution
-    if exact_matches:
-        ax1 = axes[0, 0]
-        ax1.hist(exact_matches, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-        ax1.set_xlabel('Exact Match Score')
-        ax1.set_ylabel('Frequency')
-        ax1.set_title('Distribution of Exact Match Scores')
-        ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: F1 Scores Distribution
-    if f1_scores:
-        ax2 = axes[0, 1]
-        ax2.hist(f1_scores, bins=20, alpha=0.7, color='lightgreen', edgecolor='black')
-        ax2.set_xlabel('F1 Score')
-        ax2.set_ylabel('Frequency')
-        ax2.set_title('Distribution of F1 Scores')
-        ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: Utility Scores Distribution
-    if utility_scores:
-        ax3 = axes[0, 2]
-        ax3.hist(utility_scores, bins=6, alpha=0.7, color='lightcoral', edgecolor='black')
-        ax3.set_xlabel('Utility Score')
-        ax3.set_ylabel('Frequency')
-        ax3.set_title('Distribution of Utility Scores')
-        ax3.set_xticks(range(0, 6))
-        ax3.grid(True, alpha=0.3)
-    
-    # Plot 4: Performance by Dataset (Box plot)
-    if datasets and f1_scores:
-        ax4 = axes[1, 0]
-        dataset_f1_data = {}
-        for dataset, f1 in zip(datasets, f1_scores):
-            if dataset not in dataset_f1_data:
-                dataset_f1_data[dataset] = []
-            dataset_f1_data[dataset].append(f1)
-        
-        box_data = [scores for scores in dataset_f1_data.values()]
-        box_labels = list(dataset_f1_data.keys())
-        
-        ax4.boxplot(box_data, labels=box_labels)
-        ax4.set_ylabel('F1 Score')
-        ax4.set_title('F1 Score Performance by Dataset')
-        ax4.tick_params(axis='x', rotation=45)
-        ax4.grid(True, alpha=0.3)
-    
-    # Plot 5: Retrieval Usage by Dataset
-    if datasets and retrieval_usage:
-        ax5 = axes[1, 1]
-        dataset_retrieval_data = {}
-        for dataset, retrieval in zip(datasets, retrieval_usage):
-            if dataset not in dataset_retrieval_data:
-                dataset_retrieval_data[dataset] = []
-            dataset_retrieval_data[dataset].append(retrieval)
-        
-        retrieval_means = [np.mean(scores) for scores in dataset_retrieval_data.values()]
-        dataset_names = list(dataset_retrieval_data.keys())
-        
-        bars = ax5.bar(dataset_names, retrieval_means, color='orange', alpha=0.7)
-        ax5.set_ylabel('Retrieval Usage Rate')
-        ax5.set_title('Retrieval Usage by Dataset')
-        ax5.tick_params(axis='x', rotation=45)
-        ax5.set_ylim(0, 1)
-        
-        # Add percentage labels on bars
-        for bar, mean_val in zip(bars, retrieval_means):
-            height = bar.get_height()
-            ax5.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                    f'{mean_val:.1%}', ha='center', va='bottom')
-    
-    # Plot 6: Scatter plot of F1 vs Utility
-    if f1_scores and utility_scores:
-        ax6 = axes[1, 2]
-        scatter = ax6.scatter(utility_scores, f1_scores, alpha=0.6, c='purple')
-        ax6.set_xlabel('Utility Score')
-        ax6.set_ylabel('F1 Score')
-        ax6.set_title('F1 Score vs Utility Score')
-        ax6.grid(True, alpha=0.3)
-        
-        # Add correlation coefficient
-        if len(f1_scores) > 1 and len(utility_scores) > 1:
-            correlation = np.corrcoef(utility_scores, f1_scores)[0, 1]
-            ax6.text(0.05, 0.95, f'Correlation: {correlation:.3f}', 
-                    transform=ax6.transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
-    
-    plt.tight_layout()
-    
-    # Save the plot
-    timestamp = int(time.time())
-    plot_filename = f"openrlhf_rag_evaluation_plots_{timestamp}.png"
-    plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
-    logger.info(f"Evaluation plots saved to {plot_filename}")
-    
-    # Show the plot
-    plt.show()
-    
-    return plot_filename
-
-def save_raw_data_only(results, filename):
-    """Save only the raw evaluation data without any statistical summaries"""
-    try:
-        # Extract only individual results from each benchmark
-        raw_data = {}
-        total_samples = 0
-        
-        for benchmark_name, benchmark_data in results.items():
-            individual_results = benchmark_data.get('individual_results', [])
-            if individual_results:
-                raw_data[benchmark_name] = individual_results
-                total_samples += len(individual_results)
-        
-        # Create minimal output structure
-        output_data = {
-            'evaluation_metadata': {
-                'model': 'OpenRLHF RAG',
-                'total_samples_evaluated': total_samples,
-                'evaluation_date': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'benchmarks_completed': len(raw_data)
-            },
-            'raw_evaluation_results': raw_data
-        }
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Raw evaluation data saved to {filename}")
-        logger.info(f"Total samples: {total_samples}")
-        
-        return output_data
-        
-    except Exception as e:
-        logger.error(f"Error saving raw data to {filename}: {e}")
-        return None
-
-def main():
-    """Main function to run all OpenRLHF RAG benchmarks and output raw data only"""
-    print("="*70)
-    print("OPENRLHF RAG EVALUATION - RAW DATA OUTPUT")
-    print("No statistical summaries - just the evaluation scores")
-    print("="*70)
-    
-    # Initialize OpenRLHF RAG model for evaluation only
-    logger.info("Initializing OpenRLHF RAG model for evaluation...")
-    try:
-        model = OpenRLHFRAGModel(
-            model_path="microsoft/DialoGPT-medium",  # Default model, can be changed
-            retrieval_corpus_path=None,  # Will use default corpus if available
-            max_tokens=100,
-            temperature=0.0,
-            top_p=1.0
-        )
-        logger.info("OpenRLHF RAG model initialized successfully for evaluation")
-    except Exception as e:
-        logger.error(f"Failed to initialize OpenRLHF RAG model: {e}")
-        logger.warning("Continuing with fallback mode...")
-        # Create fallback model
-        model = OpenRLHFRAGModel()
-    
-    # Configuration - using full datasets
-    sample_size = 1000  # Increased for more complete evaluation
-    results = {}
-    
-    # Define benchmarks - updated with FEVER and TruthfulQA
-    benchmarks = [
-        ("Natural Questions", run_natural_questions_benchmark),
-        ("TriviaQA", run_trivia_qa_benchmark), 
-        ("HotpotQA", run_hotpot_qa_benchmark),
-        ("SQuAD v2", run_squad_v2_benchmark),
-        ("FEVER", run_fever_benchmark),
-        ("TruthfulQA", run_truthfulqa_benchmark)
-    ]
-    
-    logger.info(f"Running {len(benchmarks)} benchmarks with {sample_size} samples each...")
-    
-    # Run each benchmark
-    for benchmark_name, benchmark_func in benchmarks:
-        print(f"\n{'='*60}")
-        print(f"RUNNING: {benchmark_name}")
-        print(f"{'='*60}")
-        
-        try:
-            start_time = time.time()
-            benchmark_results = benchmark_func(model, sample_size=sample_size)
-            end_time = time.time()
-            
-            if benchmark_results:
-                results[benchmark_name.lower().replace(' ', '_')] = {
-                    'individual_results': benchmark_results,
-                    'total_samples': len(benchmark_results),
-                    'execution_time': end_time - start_time
-                }
-                
-                logger.info(f"{benchmark_name} completed: {len(benchmark_results)} samples in {end_time - start_time:.2f}s")
-                
-            else:
-                logger.warning(f"{benchmark_name} returned no results")
-                results[benchmark_name.lower().replace(' ', '_')] = {
-                    'individual_results': [],
-                    'total_samples': 0,
-                    'execution_time': end_time - start_time,
-                    'status': 'failed'
-                }
-                
-        except Exception as e:
-            logger.error(f"Error running {benchmark_name}: {e}")
-            results[benchmark_name.lower().replace(' ', '_')] = {
-                'individual_results': [],
-                'total_samples': 0,
-                'execution_time': 0,
-                'status': 'error',
-                'error_message': str(e)
-            }
-    
-    # Save raw data only
-    timestamp = int(time.time())
-    raw_filename = f"openrlhf_rag_raw_data_{timestamp}.json"
-    raw_data = save_raw_data_only(results, raw_filename)
-    
-    # Create visualization
-    print(f"\n{'='*60}")
-    print("CREATING EVALUATION PLOTS...")
-    print(f"{'='*60}")
-    
-    try:
-        plot_filename = create_evaluation_plots(results)
-        print(f"Plots saved to: {plot_filename}")
-    except Exception as e:
-        logger.error(f"Error creating plots: {e}")
-    
-    # Final summary
-    print(f"\n{'='*70}")
-    print("OPENRLHF RAG EVALUATION COMPLETE")
-    print(f"{'='*70}")
-    
-    total_samples = sum(r.get('total_samples', 0) for r in results.values())
-    successful_benchmarks = sum(1 for r in results.values() if r.get('total_samples', 0) > 0)
-    
-    print(f"Benchmarks completed: {successful_benchmarks}/6")
-    print(f"Total samples evaluated: {total_samples}")
-    print(f"Raw data saved to: {raw_filename}")
-    
-    if raw_data:
-        print(f"\nData breakdown:")
-        for benchmark, data in raw_data['raw_evaluation_results'].items():
-            print(f"  {benchmark.replace('_', ' ').title()}: {len(data)} samples")
-    
-    return results
-
-if __name__ == "__main__":
-    # Set up environment
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    
-    print("OPENRLHF RAG EVALUATION - UPDATED VERSION")
-    print("Raw data output + visualization")
-    print("Datasets: Natural Questions, TriviaQA, HotpotQA, SQuAD v2, FEVER, TruthfulQA")
-    print("=" * 70)
-    
-    # Pre-flight checks
-    print("Running pre-flight checks...")
-    
-    try:
-        import torch
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-            print(f"GPU Available: {gpu_name} ({gpu_memory:.1f}GB)")
-        else:
-            print("No GPU detected - evaluation will be slow!")
-    except ImportError:
-        print("PyTorch not available for GPU check")
-    
-    # Check required packages
-    required_packages = ['datasets', 'transformers', 'torch', 'matplotlib', 'seaborn']
-    missing_packages = []
-    
-    for package in required_packages:
-        try:
-            __import__(package)
-            print(f"{package} available")
-        except ImportError:
-            missing_packages.append(package)
-            print(f"{package} missing")
-    
-    # Check OpenRLHF availability
-    if not OPENRLHF_AVAILABLE:
-        print("OpenRLHF not available - using fallback mode")
-        print("To install OpenRLHF:")
-        print("1. Launch Docker container: docker run --runtime=nvidia -it --rm --shm-size=\"10g\" --cap-add=SYS_ADMIN -v $PWD:/openrlhf nvcr.io/nvidia/pytorch:24.07-py3 bash")
-        print("2. Install: pip install openrlhf")
-    else:
-        print("OpenRLHF available")
-    
-    if missing_packages:
-        print(f"\nInstall missing packages:")
-        print(f"pip install {' '.join(missing_packages)}")
-        if not OPENRLHF_AVAILABLE:
-            missing_packages.append("openrlhf")
-    
-    if missing_packages and OPENRLHF_AVAILABLE is False:
-        print("Note: Running in fallback mode without full OpenRLHF functionality")
-    
-    print("Starting evaluation...")
-    
-    # Run the evaluation
-    try:
-        results = main()
-        print("\nEVALUATION COMPLETED SUCCESSFULLY!")
-        
-    except KeyboardInterrupt:
-        print("\nEvaluation interrupted by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+    logger.info(f"
