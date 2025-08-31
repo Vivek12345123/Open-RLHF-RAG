@@ -1,0 +1,20 @@
+# Core ML/NLP
+torch
+transformers
+datasets
+
+# Evaluation metrics
+rouge-score
+bert-score
+
+# Scientific stack
+numpy
+scipy
+pandas
+
+# Visualization
+matplotlib
+seaborn
+
+# HTTP requests
+requests
