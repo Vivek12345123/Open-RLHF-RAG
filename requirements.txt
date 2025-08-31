@@ -1,20 +1,12 @@
-# Core ML/NLP
-torch
-transformers
+openrlhf[vllm]
+transformers>=4.30.0
+accelerate
 datasets
-
-# Evaluation metrics
 rouge-score
-bert-score
-
-# Scientific stack
-numpy
-scipy
-pandas
-
-# Visualization
+nltk
 matplotlib
-seaborn
-
-# HTTP requests
-requests
+pandas
+tqdm
+faiss-gpu
+tensorboard
+scipy
