@@ -1,1397 +1,961 @@
-import json
-import time
 import os
-import subprocess
-import sys
-from typing import List, Dict, Any, Optional, Tuple
+import json
+import torch
 import logging
-from pathlib import Path
-import requests
-import re
-from collections import Counter
-import string
+import argparse
 import numpy as np
-from scipy import stats
-import matplotlib.pyplot as plt
-import seaborn as sns
+from tqdm import tqdm
+from typing import List, Dict, Any, Tuple, Union, Optional
+from datasets import load_dataset
+from rouge_score import rouge_scorer
+from collections import Counter
+import re
+import string
 import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
 
-# Core dependencies
+# Try importing different retriever libraries but don't fail if not available
 try:
-    from datasets import load_dataset
-    HF_DATASETS_AVAILABLE = True
+    import faiss
+    FAISS_AVAILABLE = True
 except ImportError:
-    print("Error: datasets not available. Install with: pip install datasets")
-    HF_DATASETS_AVAILABLE = False
-
-try:
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    TORCH_AVAILABLE = True
-except ImportError:
-    print("Error: PyTorch/Transformers not available. Install with: pip install torch transformers")
-    TORCH_AVAILABLE = False
-
-# Enhanced evaluation metrics
-try:
-    from rouge_score import rouge_scorer
-    ROUGE_AVAILABLE = True
-except ImportError:
-    print("Warning: rouge_score not available. Install with: pip install rouge-score")
-    ROUGE_AVAILABLE = False
+    FAISS_AVAILABLE = False
+    warnings.warn("FAISS not available. Install with: pip install faiss-gpu or faiss-cpu")
 
 try:
-    from bert_score import score as bert_score
-    BERTSCORE_AVAILABLE = True
+    from elasticsearch import Elasticsearch
+    ES_AVAILABLE = True
 except ImportError:
-    print("Warning: bert_score not available. Install with: pip install bert_score")
-    BERTSCORE_AVAILABLE = False
+    ES_AVAILABLE = False
+    warnings.warn("Elasticsearch not available. Install with: pip install elasticsearch")
+
+try:
+    import chromadb
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
+    warnings.warn("ChromaDB not available. Install with: pip install chromadb")
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
+from transformers.generation import GenerationConfig
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class TIRESRAGSystem:
-    """Complete TIRESRAG-R1 system implementation following the project structure"""
+class RAGEvaluator:
+    """Evaluator for RAG systems using OpenRLHF components"""
     
     def __init__(self, 
-                 project_root: str = ".",
-                 model_name: str = "TIRESRAG-R1-Instruct",
-                 retrieval_port: int = 8000,
-                 reflection_port: int = 8001, 
-                 thinking_port: int = 8002,
-                 max_tokens: int = 512,
-                 temperature: float = 0.1):
+                 model_name: str,
+                 retriever_type: str = "faiss",
+                 retriever_params: Dict = None,
+                 reward_model_path: str = None,
+                 max_length: int = 2048,
+                 batch_size: int = 8,
+                 device: str = None,
+                 generation_config: Dict = None):
+        """
+        Initialize the RAG evaluator.
         
-        self.project_root = Path(project_root)
-        self.model_name = model_name
-        self.retrieval_url = f"http://localhost:{retrieval_port}"
-        self.reflection_url = f"http://localhost:{reflection_port}"
-        self.thinking_url = f"http://localhost:{thinking_port}"
-        self.max_tokens = max_tokens
-        self.temperature = temperature
+        Args:
+            model_name: Name or path of the LLM to use
+            retriever_type: Type of retriever ("faiss", "es", "chroma")
+            retriever_params: Parameters for the retriever
+            reward_model_path: Path to an optional reward model
+            max_length: Maximum sequence length
+            batch_size: Batch size for generation
+            device: Device to use ("cuda", "cpu")
+            generation_config: Additional generation configuration parameters
+        """
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.generation_config = generation_config or {}
         
-        # System status
-        self.services_running = False
-        self.model_loaded = False
-        self.index_built = False
-        
-        # Initialize components
-        self._check_project_structure()
-        self._load_tiresrag_model()
-        
-    def _check_project_structure(self):
-        """Verify TIRESRAG-R1 project structure exists"""
-        required_paths = [
-            self.project_root / "scripts" / "wiki_servish.sh",
-            self.project_root / "scripts" / "answer_reflection_reward.sh", 
-            self.project_root / "scripts" / "sufficient_thinking_reward.sh",
-            self.project_root / "evaluation" / "FlashRAG" / "scripts",
-            self.project_root / "requirements.txt"
-        ]
-        
-        missing_paths = [p for p in required_paths if not p.exists()]
-        if missing_paths:
-            logger.warning(f"Missing TIRESRAG-R1 components: {missing_paths}")
-            logger.warning("Some functionality may be limited")
-        else:
-            logger.info("TIRESRAG-R1 project structure verified")
-    
-    def _load_tiresrag_model(self):
-        """Load the trained TIRESRAG-R1 model"""
-        try:
-            if not TORCH_AVAILABLE:
-                logger.error("PyTorch not available - cannot load TIRESRAG model")
-                return
-                
-            # Look for trained TIRESRAG model in expected locations
-            model_paths = [
-                self.project_root / "models" / self.model_name,
-                self.project_root / "checkpoints" / self.model_name,
-                f"./models/{self.model_name}",
-                self.model_name  # Try as HuggingFace model ID
-            ]
+        # Initialize tokenizer and model
+        logger.info(f"Loading model {model_name}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            model_loaded = False
-            for model_path in model_paths:
-                try:
-                    logger.info(f"Attempting to load TIRESRAG model from: {model_path}")
-                    
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        str(model_path), 
-                        trust_remote_code=True,
-                        padding_side='left'
-                    )
-                    
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        str(model_path),
-                        torch_dtype=torch.bfloat16,
-                        device_map="auto",
-                        trust_remote_code=True,
-                        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
-                    )
-                    
-                    self.model.eval()
-                    self.model_loaded = True
-                    model_loaded = True
-                    logger.info(f"Successfully loaded TIRESRAG-R1 model from {model_path}")
-                    break
-                    
-                except Exception as e:
-                    logger.debug(f"Failed to load from {model_path}: {e}")
-                    continue
-            
-            if not model_loaded:
-                logger.warning("Could not load trained TIRESRAG model - using fallback")
-                self._load_fallback_model()
-                
-        except Exception as e:
-            logger.error(f"Error in model loading: {e}")
-            self._load_fallback_model()
-    
-    def _load_fallback_model(self):
-        """Load fallback base model for testing"""
-        try:
-            fallback_model = "Qwen/Qwen2.5-7B-Instruct"
-            logger.info(f"Loading fallback model: {fallback_model}")
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(fallback_model, trust_remote_code=True)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                fallback_model,
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if self.device == "cuda" else None,
+            attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
+        )
+        self.model.eval()
+        
+        # Initialize reward model if provided
+        self.reward_model = None
+        if reward_model_path:
+            logger.info(f"Loading reward model from {reward_model_path}...")
+            self.reward_model = AutoModelForSequenceClassification.from_pretrained(
+                reward_model_path,
+                num_labels=1,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else "cpu",
-                trust_remote_code=True
+                device_map="auto" if self.device == "cuda" else None,
+                attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
             )
-            self.model.eval()
-            self.model_loaded = True
-            logger.info("Fallback model loaded successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to load fallback model: {e}")
-            self.tokenizer = None
-            self.model = None
+            self.reward_model.eval()
+        
+        # Setup ROUGE scorer
+        self.rouge_scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        
+        # Initialize retriever
+        self.retriever = self._init_retriever(retriever_type, retriever_params or {})
     
-    def setup_services(self):
-        """Start all required TIRESRAG services"""
-        logger.info("Setting up TIRESRAG-R1 services...")
-        
-        scripts_dir = self.project_root / "scripts"
-        if not scripts_dir.exists():
-            logger.error("Scripts directory not found - cannot start services")
-            return False
-        
-        services = [
-            ("Retrieval Service", "wiki_servish.sh", 8000),
-            ("Answer Reflection Service", "answer_reflection_reward.sh", 8001),
-            ("Thinking Quality Service", "sufficient_thinking_reward.sh", 8002)
-        ]
-        
-        for service_name, script_name, port in services:
-            script_path = scripts_dir / script_name
-            if script_path.exists():
+    def _init_retriever(self, retriever_type, params):
+        """Initialize the appropriate retriever based on type"""
+        if retriever_type == "faiss":
+            if not FAISS_AVAILABLE:
+                raise ImportError("FAISS is required for FAISS retriever. Install with: pip install faiss-gpu or faiss-cpu")
+            
+            # Setup FAISS retriever - parameters should include index_path and documents
+            index = None
+            documents = params.get("documents", [])
+            
+            if "index_path" in params and os.path.exists(params["index_path"]):
                 try:
-                    logger.info(f"Starting {service_name}...")
-                    # Run in background - in production you'd use proper process management
-                    subprocess.Popen(
-                        ["bash", str(script_path)], 
-                        cwd=str(scripts_dir),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                    time.sleep(2)  # Allow service to start
-                    
-                    # Verify service is running
-                    if self._check_service_health(port):
-                        logger.info(f"{service_name} started successfully on port {port}")
-                    else:
-                        logger.warning(f"{service_name} may not be running properly")
-                        
+                    index = faiss.read_index(params["index_path"])
+                    logger.info(f"Loaded FAISS index from {params['index_path']}")
                 except Exception as e:
-                    logger.error(f"Failed to start {service_name}: {e}")
-            else:
-                logger.warning(f"Script not found: {script_path}")
-        
-        self.services_running = True
-        return True
-    
-    def _check_service_health(self, port: int) -> bool:
-        """Check if a service is responding on the given port"""
-        try:
-            response = requests.get(f"http://localhost:{port}/health", timeout=5)
-            return response.status_code == 200
-        except:
-            # Services might not have health endpoints
-            return True
-    
-    def build_retrieval_index(self):
-        """Build FAISS retrieval index using FlashRAG"""
-        logger.info("Building retrieval index...")
-        
-        flashrag_scripts = self.project_root / "evaluation" / "FlashRAG" / "scripts"
-        if not flashrag_scripts.exists():
-            logger.error("FlashRAG scripts not found")
-            return False
-        
-        try:
-            # Step 1: Chunk documents
-            chunk_script = flashrag_scripts / "chunk.sh"
-            if chunk_script.exists():
-                logger.info("Chunking documents...")
-                subprocess.run(["bash", str(chunk_script)], cwd=str(flashrag_scripts), check=True)
+                    logger.error(f"Failed to load FAISS index: {e}")
             
-            # Step 2: Build FAISS index  
-            index_script = flashrag_scripts / "build_index.sh"
-            if index_script.exists():
-                logger.info("Building FAISS index...")
-                subprocess.run(["bash", str(index_script)], cwd=str(flashrag_scripts), check=True)
+            return {"type": "faiss", "index": index, "params": params}
             
-            self.index_built = True
-            logger.info("Retrieval index built successfully")
-            return True
+        elif retriever_type == "es":
+            if not ES_AVAILABLE:
+                raise ImportError("Elasticsearch is required for ES retriever. Install with: pip install elasticsearch")
             
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to build retrieval index: {e}")
-            return False
+            # Setup Elasticsearch retriever
+            es_config = params.get("connection", {})
+            try:
+                es = Elasticsearch(**es_config)
+                if not es.ping():
+                    logger.warning("Could not connect to Elasticsearch")
+            except Exception as e:
+                logger.error(f"Error connecting to Elasticsearch: {e}")
+                es = None
+                
+            return {"type": "es", "client": es, "params": params}
+            
+        elif retriever_type == "chroma":
+            if not CHROMADB_AVAILABLE:
+                raise ImportError("ChromaDB is required for Chroma retriever. Install with: pip install chromadb")
+            
+            # Setup ChromaDB retriever
+            chroma_config = params.get("connection", {})
+            try:
+                client = chromadb.Client(chroma_config)
+            except Exception as e:
+                logger.error(f"Error connecting to ChromaDB: {e}")
+                client = None
+                
+            return {"type": "chroma", "client": client, "params": params}
+            
+        elif retriever_type == "mock":
+            # Mock retriever for testing
+            return {"type": "mock", "params": params}
+            
+        else:
+            raise ValueError(f"Unsupported retriever type: {retriever_type}")
     
     def retrieve_documents(self, query: str, top_k: int = 5) -> List[Dict]:
-        """Retrieve documents using FlashRAG retrieval service"""
-        try:
-            # Try FlashRAG-specific API format first
-            payload = {
-                "query": query,
-                "retriever_name": "bge",  # Common FlashRAG retriever
-                "corpus_name": "wiki",
-                "top_k": top_k,
-                "rerank": True
+        """Retrieve documents based on the query"""
+        retriever = self.retriever
+        
+        if retriever["type"] == "faiss":
+            # FAISS retrieval logic
+            if retriever["index"] is None:
+                logger.error("FAISS index not built or loaded")
+                return []
+            
+            # Convert query to vector using model embedding
+            query_vector = self._get_embedding(query)
+            
+            # Search in FAISS index
+            distances, indices = retriever["index"].search(np.array([query_vector]), top_k)
+            
+            # Convert results to documents
+            documents = []
+            for i, idx in enumerate(indices[0]):
+                if idx >= 0 and idx < len(retriever["params"].get("documents", [])):  # Valid index
+                    doc = retriever["params"]["documents"][idx]
+                    doc["score"] = float(distances[0][i])
+                    documents.append(doc)
+            
+            return documents
+            
+        elif retriever["type"] == "es":
+            # Elasticsearch retrieval logic
+            if retriever["client"] is None:
+                logger.error("Elasticsearch client not connected")
+                return []
+                
+            es_query = {
+                "query": {
+                    "match": {
+                        "content": query
+                    }
+                },
+                "size": top_k
             }
             
-            response = requests.post(
-                f"{self.retrieval_url}/retrieve",
-                json=payload,
-                timeout=30,
-                headers={"Content-Type": "application/json"}
-            )
+            # Add any custom query parameters
+            if "query_params" in retriever["params"]:
+                es_query.update(retriever["params"]["query_params"])
             
-            if response.status_code == 200:
-                data = response.json()
-                # Handle different response formats
-                if "documents" in data:
-                    return data["documents"]
-                elif "retrieved_docs" in data:
-                    return data["retrieved_docs"]
-                else:
-                    return data.get("results", [])
-            else:
-                logger.warning(f"Retrieval API returned {response.status_code}: {response.text}")
+            # Execute search
+            try:
+                index_name = retriever["params"].get("index_name", "documents")
+                results = retriever["client"].search(index=index_name, body=es_query)
                 
-        except Exception as e:
-            logger.warning(f"Retrieval API call failed: {e}")
+                # Convert results to documents
+                documents = []
+                for hit in results["hits"]["hits"]:
+                    doc = {
+                        "id": hit["_id"],
+                        "content": hit["_source"].get("content", ""),
+                        "title": hit["_source"].get("title", ""),
+                        "score": hit["_score"]
+                    }
+                    documents.append(doc)
+                
+                return documents
+            except Exception as e:
+                logger.error(f"Error during Elasticsearch search: {e}")
+                return []
+            
+        elif retriever["type"] == "chroma":
+            # ChromaDB retrieval logic
+            if retriever["client"] is None:
+                logger.error("ChromaDB client not connected")
+                return []
+                
+            try:
+                collection_name = retriever["params"].get("collection_name", "documents")
+                collection = retriever["client"].get_collection(collection_name)
+                
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=top_k
+                )
+                
+                # Convert results to documents
+                documents = []
+                for i, (doc_id, content, metadata, distance) in enumerate(zip(
+                    results.get("ids", [[]])[0],
+                    results.get("documents", [[]])[0],
+                    results.get("metadatas", [[]])[0],
+                    results.get("distances", [[]])[0]
+                )):
+                    doc = {
+                        "id": doc_id,
+                        "content": content,
+                        "metadata": metadata,
+                        "score": distance
+                    }
+                    documents.append(doc)
+                
+                return documents
+            except Exception as e:
+                logger.error(f"Error during ChromaDB search: {e}")
+                return []
+                
+        elif retriever["type"] == "mock":
+            # Mock retriever for testing
+            mock_docs = retriever["params"].get("mock_documents", [])
+            if not mock_docs:
+                # Generate some mock documents related to the query
+                mock_docs = [
+                    {
+                        "id": f"doc_{i}",
+                        "title": f"Mock Document {i}",
+                        "content": f"This is mock content related to: {query}. Information point {i}.",
+                        "score": 1.0 - (i * 0.1)
+                    }
+                    for i in range(min(top_k, 5))
+                ]
+            return mock_docs[:top_k]
         
-        # Return empty list if retrieval fails
         return []
     
-    def evaluate_answer_reflection(self, question: str, answer: str, context: str) -> Dict[str, float]:
-        """Get answer quality reflection scores"""
-        try:
-            payload = {
-                "question": question,
-                "answer": answer, 
-                "context": context,
-                "metrics": ["quality", "relevance", "completeness", "factuality"]
-            }
-            
-            response = requests.post(
-                f"{self.reflection_url}/evaluate",
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-                
-        except Exception as e:
-            logger.debug(f"Reflection API call failed: {e}")
+    def _get_embedding(self, text: str) -> np.ndarray:
+        """Get embedding for text using the model"""
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, 
+                               max_length=self.max_length).to(self.device)
         
-        # Fallback scoring based on heuristics
-        return self._fallback_reflection_scoring(question, answer, context)
+        with torch.no_grad():
+            # Use model's embedding layer to get embeddings
+            embeddings = self.model.get_input_embeddings()(inputs["input_ids"])
+            
+            # Average the embeddings across sequence length
+            embedding = torch.mean(embeddings, dim=1).cpu().numpy()
+        
+        return embedding
     
-    def evaluate_thinking_quality(self, question: str, thinking: str) -> Dict[str, float]:
-        """Evaluate thinking process quality"""
-        try:
-            payload = {
-                "question": question,
-                "thinking": thinking,
-                "metrics": ["sufficiency", "coherence", "depth", "relevance"]
-            }
-            
-            response = requests.post(
-                f"{self.thinking_url}/evaluate", 
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-                
-        except Exception as e:
-            logger.debug(f"Thinking quality API call failed: {e}")
-        
-        return self._fallback_thinking_scoring(thinking)
-    
-    def _fallback_reflection_scoring(self, question: str, answer: str, context: str) -> Dict[str, float]:
-        """Fallback reflection scoring using heuristics"""
-        scores = {}
-        
-        # Quality: based on length and structure
-        scores['quality'] = min(0.9, len(answer.split()) / 50.0) if answer else 0.1
-        
-        # Relevance: keyword overlap with question
-        q_words = set(question.lower().split())
-        a_words = set(answer.lower().split())
-        scores['relevance'] = len(q_words & a_words) / max(len(q_words), 1) if answer else 0.0
-        
-        # Completeness: presence of key indicators
-        completeness_indicators = ['because', 'therefore', 'however', 'specifically', 'according to']
-        scores['completeness'] = sum(1 for ind in completeness_indicators if ind in answer.lower()) / len(completeness_indicators)
-        
-        # Factuality: conservative estimate based on context usage
-        scores['factuality'] = 0.8 if context and len(context) > 100 else 0.5
-        
-        return scores
-    
-    def _fallback_thinking_scoring(self, thinking: str) -> Dict[str, float]:
-        """Fallback thinking quality scoring"""
-        scores = {}
-        
-        if not thinking:
-            return {"sufficiency": 0.0, "coherence": 0.0, "depth": 0.0, "relevance": 0.0}
-        
-        # Sufficiency: based on length and reasoning indicators
-        reasoning_words = ['because', 'since', 'therefore', 'thus', 'however', 'although', 'while', 'whereas']
-        reasoning_count = sum(1 for word in reasoning_words if word in thinking.lower())
-        scores['sufficiency'] = min(0.95, reasoning_count / 3.0 + len(thinking.split()) / 100.0)
-        
-        # Coherence: sentence connectivity
-        sentences = thinking.split('.')
-        scores['coherence'] = min(0.9, len(sentences) / 5.0) if len(sentences) > 1 else 0.3
-        
-        # Depth: presence of analysis indicators
-        depth_indicators = ['analyze', 'consider', 'examine', 'evaluate', 'compare', 'contrast', 'implications']
-        scores['depth'] = sum(1 for ind in depth_indicators if ind in thinking.lower()) / len(depth_indicators)
-        
-        # Relevance: similar to sufficiency for thinking
-        scores['relevance'] = scores['sufficiency'] * 0.9
-        
-        return scores
-    
-    def think_retrieve_reflect(self, question: str) -> Dict[str, Any]:
-        """Complete TIRESRAG-R1 think-retrieve-reflect process"""
-        start_time = time.time()
-        
-        if not self.model_loaded:
-            logger.error("TIRESRAG model not loaded")
-            return self._error_response("Model not loaded", start_time)
-        
-        try:
-            # Step 1: THINK - Generate initial reasoning
-            thinking_prompt = self._build_thinking_prompt(question)
-            thinking = self._generate_text(thinking_prompt, max_tokens=200)
-            
-            # Evaluate thinking quality
-            thinking_scores = self.evaluate_thinking_quality(question, thinking)
-            
-            # Step 2: RETRIEVE - Get relevant documents  
-            retrieved_docs = self.retrieve_documents(question, top_k=5)
-            context = self._format_context(retrieved_docs)
-            
-            # Step 3: GENERATE - Produce final answer
-            answer_prompt = self._build_answer_prompt(question, thinking, context)
-            answer = self._generate_text(answer_prompt, max_tokens=300)
-            
-            # Step 4: REFLECT - Evaluate answer quality
-            reflection_scores = self.evaluate_answer_reflection(question, answer, context)
-            
-            inference_time = time.time() - start_time
-            
-            return {
-                'text': answer,
-                'thinking': thinking,
-                'thinking_scores': thinking_scores,
-                'retrieved_docs': retrieved_docs,
-                'context': context,
-                'reflection_scores': reflection_scores,
-                'tokens_generated': len(answer.split()) + len(thinking.split()),
-                'inference_time': inference_time,
-                'uses_retrieval': len(retrieved_docs) > 0,
-                'num_retrieved_docs': len(retrieved_docs),
-                'overall_quality': self._compute_overall_quality(thinking_scores, reflection_scores)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in think-retrieve-reflect: {e}")
-            return self._error_response(str(e), start_time)
-    
-    def _build_thinking_prompt(self, question: str) -> str:
-        """Build prompt for thinking phase"""
-        return f"""<|im_start|>system
-You are TIRESRAG-R1, an advanced reasoning system. Think step-by-step about the question before retrieving information.
-<|im_end|>
-<|im_start|>user  
-Question: {question}
-
-Let me think about this step by step:
-<|im_end|>
-<|im_start|>assistant
-I need to think through this question carefully:
-
-"""
-    
-    def _build_answer_prompt(self, question: str, thinking: str, context: str) -> str:
-        """Build prompt for answer generation with thinking and context"""
-        context_section = f"\nRetrieved Information:\n{context}\n" if context else ""
-        
-        return f"""<|im_start|>system
-You are TIRESRAG-R1. Use your thinking and retrieved information to provide an accurate, well-reasoned answer.
-<|im_end|>
-<|im_start|>user
-Question: {question}
-
-My thinking: {thinking}{context_section}
-Based on my analysis and the information above, here is my answer:
-<|im_end|>
-<|im_start|>assistant
-"""
-    
-    def _format_context(self, docs: List[Dict]) -> str:
-        """Format retrieved documents into context"""
-        if not docs:
-            return ""
-        
-        context_parts = []
-        for i, doc in enumerate(docs[:5]):
-            title = doc.get('title', f'Document {i+1}')
-            content = doc.get('content', doc.get('text', doc.get('passage', '')))
-            
-            if content:
-                # Truncate very long content
-                if len(content) > 400:
-                    content = content[:400] + "..."
-                context_parts.append(f"[{title}] {content}")
-        
-        return "\n\n".join(context_parts)
-    
-    def _generate_text(self, prompt: str, max_tokens: int = 200) -> str:
-        """Generate text using the loaded model"""
-        if not self.model or not self.tokenizer:
-            return "[Model not available]"
-        
-        try:
-            inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                truncation=True, 
-                max_length=2048,
-                padding=True
-            )
-            
-            # Move to same device as model
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=self.temperature,
-                    top_p=0.9,
-                    do_sample=self.temperature > 0,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    repetition_penalty=1.1
-                )
-            
-            # Decode only new tokens
-            new_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            
-            # Clean up response
-            response = response.strip()
-            if '<|im_end|>' in response:
-                response = response.split('<|im_end|>')[0].strip()
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Text generation error: {e}")
-            return f"[Generation Error: {str(e)}]"
-    
-    def _compute_overall_quality(self, thinking_scores: Dict, reflection_scores: Dict) -> float:
-        """Compute overall quality score combining thinking and reflection"""
-        thinking_avg = np.mean(list(thinking_scores.values())) if thinking_scores else 0.0
-        reflection_avg = np.mean(list(reflection_scores.values())) if reflection_scores else 0.0
-        
-        # Weight thinking and reflection equally
-        return (thinking_avg + reflection_avg) / 2.0
-    
-    def _error_response(self, error_msg: str, start_time: float) -> Dict[str, Any]:
-        """Generate error response"""
-        return {
-            'text': f"[Error] {error_msg}",
-            'thinking': "",
-            'thinking_scores': {},
-            'retrieved_docs': [],
-            'context': "",
-            'reflection_scores': {},
-            'tokens_generated': 0,
-            'inference_time': time.time() - start_time,
-            'uses_retrieval': False,
-            'num_retrieved_docs': 0,
-            'overall_quality': 0.0
-        }
-
-class TIRESRAGEvaluator:
-    """Enhanced evaluator for TIRESRAG-R1 with comprehensive metrics"""
-    
-    def __init__(self):
-        if ROUGE_AVAILABLE:
-            self.rouge_scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    def generate_answer(self, query: str, context: str = None) -> str:
+        """Generate an answer using the model"""
+        # Prepare prompt with context if available
+        if context:
+            prompt = f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"
         else:
-            self.rouge_scorer = None
+            prompt = f"Question: {query}\n\nAnswer:"
+        
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, 
+                              max_length=self.max_length).to(self.device)
+        
+        # Configure generation parameters
+        default_gen_config = {
+            "max_new_tokens": 1024,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "do_sample": True
+        }
+        
+        # Override with any user-provided generation config
+        gen_params = {**default_gen_config, **self.generation_config}
+        gen_config = GenerationConfig(**gen_params)
+        
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                generation_config=gen_config
+            )
+        
+        # Decode output, extracting only the generated part (not input)
+        generated_text = self.tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        
+        return generated_text.strip()
     
-    def normalize_answer(self, s: str) -> str:
-        """Normalize answer for evaluation (SQuAD style)"""
-        def remove_articles(text):
-            regex = re.compile(r'\b(a|an|the)\b', re.IGNORECASE)
-            return re.sub(regex, ' ', text)
-        
-        def white_space_fix(text):
-            return ' '.join(text.split())
-        
-        def remove_punc(text):
-            exclude = set(string.punctuation)
-            return ''.join(ch for ch in text if ch not in exclude)
-        
-        def lower(text):
-            return text.lower()
-        
-        return white_space_fix(remove_articles(remove_punc(lower(s))))
-    
-    def exact_match_score(self, prediction: str, ground_truth: str) -> float:
-        """Compute exact match score"""
-        return float(self.normalize_answer(prediction) == self.normalize_answer(ground_truth))
-    
-    def f1_score(self, prediction: str, ground_truth: str) -> float:
-        """Compute token-level F1 score"""
-        pred_tokens = self.normalize_answer(prediction).split()
-        gold_tokens = self.normalize_answer(ground_truth).split()
-        
-        if not pred_tokens and not gold_tokens:
-            return 1.0
-        if not pred_tokens or not gold_tokens:
+    def compute_reward(self, query: str, response: str, context: str = None) -> float:
+        """Compute reward score for a response"""
+        if not self.reward_model:
+            logger.warning("No reward model available")
             return 0.0
         
-        common = Counter(pred_tokens) & Counter(gold_tokens)
+        # Prepare input for reward model
+        if context:
+            prompt = f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer: {response}"
+        else:
+            prompt = f"Question: {query}\n\nAnswer: {response}"
+        
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, 
+                               max_length=self.max_length, padding="max_length").to(self.device)
+        
+        with torch.no_grad():
+            # Get reward score
+            outputs = self.reward_model(**inputs)
+            reward = outputs.logits.item()
+        
+        return reward
+    
+    def normalize_text(self, text: str) -> str:
+        """Normalize text for evaluation"""
+        # Remove articles
+        text = re.sub(r'\b(a|an|the)\b', ' ', text.lower())
+        # Remove punctuation
+        text = text.translate(str.maketrans('', '', string.punctuation))
+        # Normalize whitespace
+        text = ' '.join(text.split())
+        return text
+    
+    def compute_f1_score(self, prediction: str, reference: str) -> float:
+        """Compute F1 score between prediction and reference"""
+        pred_tokens = self.normalize_text(prediction).split()
+        ref_tokens = self.normalize_text(reference).split()
+        
+        if not pred_tokens and not ref_tokens:
+            return 1.0
+        if not pred_tokens or not ref_tokens:
+            return 0.0
+        
+        common = Counter(pred_tokens) & Counter(ref_tokens)
         num_same = sum(common.values())
         
         if num_same == 0:
             return 0.0
         
         precision = num_same / len(pred_tokens)
-        recall = num_same / len(gold_tokens)
+        recall = num_same / len(ref_tokens)
         f1 = (2 * precision * recall) / (precision + recall)
         
         return f1
     
-    def evaluate_against_multiple_answers(self, prediction: str, ground_truths: List[str]) -> Dict[str, float]:
-        """Evaluate against multiple possible answers"""
-        if not ground_truths:
-            return {'em': 0.0, 'f1': 0.0}
+    def compute_metrics(self, prediction: str, reference: str) -> Dict[str, float]:
+        """Compute various metrics between prediction and reference"""
+        metrics = {}
         
-        best_em = 0.0
-        best_f1 = 0.0
+        # F1 score
+        metrics["f1"] = self.compute_f1_score(prediction, reference)
         
-        for gt in ground_truths:
-            if not gt or not gt.strip():
-                continue
-                
-            em = self.exact_match_score(prediction, gt)
-            f1 = self.f1_score(prediction, gt)
-            
-            best_em = max(best_em, em)
-            best_f1 = max(best_f1, f1)
-        
-        return {'em': best_em, 'f1': best_f1}
-    
-    def compute_rouge_scores(self, prediction: str, ground_truth: str) -> Dict[str, float]:
-        """Compute ROUGE scores if available"""
-        if not self.rouge_scorer:
-            return {}
-        
+        # ROUGE scores
         try:
-            scores = self.rouge_scorer.score(ground_truth, prediction)
-            return {
-                'rouge1_f': scores['rouge1'].fmeasure,
-                'rouge2_f': scores['rouge2'].fmeasure,
-                'rougeL_f': scores['rougeL'].fmeasure
-            }
-        except:
-            return {}
-
-# Dataset loading utilities
-def load_dataset_safe(dataset_options: List[Tuple], sample_size: int):
-    """Safely load dataset with multiple fallback options"""
-    if not HF_DATASETS_AVAILABLE:
-        logger.error("datasets library not available")
-        return None
-    
-    for option in dataset_options:
-        try:
-            if len(option) == 2:
-                dataset_name, split = option
-                logger.info(f"Loading {dataset_name}...")
-                ds = load_dataset(dataset_name, split=split)
-            elif len(option) == 3:
-                dataset_name, config, split = option
-                logger.info(f"Loading {dataset_name}[{config}]...")
-                ds = load_dataset(dataset_name, config, split=split)
-            else:
-                continue
-            
-            if sample_size and sample_size < len(ds):
-                ds = ds.select(range(sample_size))
-            
-            logger.info(f"Successfully loaded {len(ds)} samples from {dataset_name}")
-            return ds
-            
+            rouge_scores = self.rouge_scorer.score(reference, prediction)
+            metrics["rouge1"] = rouge_scores["rouge1"].fmeasure
+            metrics["rouge2"] = rouge_scores["rouge2"].fmeasure
+            metrics["rougeL"] = rouge_scores["rougeL"].fmeasure
         except Exception as e:
-            logger.warning(f"Failed to load {option[0]}: {e}")
-            continue
+            logger.warning(f"Error computing ROUGE scores: {e}")
+            metrics["rouge1"] = metrics["rouge2"] = metrics["rougeL"] = 0.0
+        
+        # Exact match (after normalization)
+        metrics["exact_match"] = float(self.normalize_text(prediction) == self.normalize_text(reference))
+        
+        return metrics
     
-    return None
-
-# Benchmark implementations with correct HuggingFace dataset names
-def run_hotpotqa_evaluation(tiresrag: TIRESRAGSystem, evaluator: TIRESRAGEvaluator, sample_size: int = 100) -> List[Dict]:
-    """HotpotQA multi-hop reasoning evaluation"""
-    logger.info(f"Running HotpotQA evaluation ({sample_size} samples)")
-    
-    # Correct HuggingFace dataset names for HotpotQA
-    dataset_options = [
-        ("hotpot_qa", "distractor", "validation"),
-        ("hotpot_qa", "fullwiki", "validation")
-    ]
-    
-    dataset = load_dataset_safe(dataset_options, sample_size)
-    if dataset is None:
-        logger.error("Could not load HotpotQA dataset")
-        return []
-    
-    results = []
-    for i, item in enumerate(dataset):
+    def evaluate_dataset(self, dataset_name_or_path: str, split: str = "test", 
+                         max_samples: int = None, retrieval_only: bool = False,
+                         query_key: str = None, answer_key: str = None) -> Dict:
+        """
+        Evaluate RAG system on a dataset
+        
+        Args:
+            dataset_name_or_path: HuggingFace dataset name or path
+            split: Dataset split to use
+            max_samples: Maximum number of samples to evaluate
+            retrieval_only: Whether to only evaluate retrieval without generation
+            query_key: Key for the query field in the dataset (auto-detected if None)
+            answer_key: Key for the answer field in the dataset (auto-detected if None)
+        """
+        logger.info(f"Loading dataset {dataset_name_or_path}, split {split}...")
+        
+        # Load dataset
         try:
-            question = item.get('question', '')
-            answer = item.get('answer', '')
-            level = item.get('level', 'unknown')
-            type_q = item.get('type', 'unknown')
-            
-            if not question or not answer:
-                continue
-                
-            # Get TIRESRAG response
-            response = tiresrag.think_retrieve_reflect(question)
-            
-            # Evaluate response
-            scores = evaluator.evaluate_against_multiple_answers(response['text'], [answer])
-            rouge_scores = evaluator.compute_rouge_scores(response['text'], answer)
-            
-            result = {
-                'dataset': 'hotpotqa',
-                'question': question,
-                'ground_truth': answer,
-                'prediction': response['text'],
-                'thinking': response['thinking'],
-                'level': level,
-                'type': type_q,
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'thinking_scores': response['thinking_scores'],
-                'reflection_scores': response['reflection_scores'],
-                'overall_quality': response['overall_quality'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'uses_retrieval': response['uses_retrieval'],
-                'num_retrieved_docs': response['num_retrieved_docs']
-            }
-            result.update(rouge_scores)
-            results.append(result)
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(dataset)} HotpotQA samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing HotpotQA item {i}: {e}")
-            continue
-    
-    return results
-
-def run_natural_questions_evaluation(tiresrag: TIRESRAGSystem, evaluator: TIRESRAGEvaluator, sample_size: int = 100) -> List[Dict]:
-    """Google Natural Questions evaluation"""
-    logger.info(f"Running Natural Questions evaluation ({sample_size} samples)")
-    
-    # Correct HuggingFace dataset names for Natural Questions
-    dataset_options = [
-        ("natural_questions", "validation"),
-        ("google-research-datasets/natural_questions", "validation")
-    ]
-    
-    dataset = load_dataset_safe(dataset_options, sample_size)
-    if dataset is None:
-        logger.error("Could not load Natural Questions dataset")
-        return []
-    
-    results = []
-    for i, item in enumerate(dataset):
-        try:
-            # Handle Natural Questions format
-            question = ""
-            if 'question' in item:
-                if isinstance(item['question'], dict):
-                    question = item['question'].get('text', '')
+            if "@" in dataset_name_or_path:
+                data_type, data_path = dataset_name_or_path.split("@", 1)
+                if data_type == "json":
+                    dataset = load_dataset(data_type, data_files={split: f"{data_path}/{split}.jsonl"}, split=split)
                 else:
-                    question = item['question']
-            elif 'question_text' in item:
-                question = item['question_text']
-            
-            # Extract answers from annotations
-            answers = []
-            if 'annotations' in item:
-                for annotation in item['annotations']:
-                    if 'short_answers' in annotation:
-                        for short_answer in annotation['short_answers']:
-                            if 'text' in short_answer:
-                                answers.append(short_answer['text'])
-                    if 'yes_no_answer' in annotation:
-                        yn_answer = annotation['yes_no_answer']
-                        if yn_answer == 0:
-                            answers.append('No')
-                        elif yn_answer == 1:
-                            answers.append('Yes')
-            
-            if not question or not answers:
-                continue
-                
-            # Get TIRESRAG response
-            response = tiresrag.think_retrieve_reflect(question)
-            
-            # Evaluate response
-            scores = evaluator.evaluate_against_multiple_answers(response['text'], answers)
-            rouge_scores = evaluator.compute_rouge_scores(response['text'], answers[0] if answers else "")
-            
-            result = {
-                'dataset': 'natural_questions',
-                'question': question,
-                'ground_truth': answers,
-                'prediction': response['text'],
-                'thinking': response['thinking'],
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'thinking_scores': response['thinking_scores'],
-                'reflection_scores': response['reflection_scores'],
-                'overall_quality': response['overall_quality'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'uses_retrieval': response['uses_retrieval'],
-                'num_retrieved_docs': response['num_retrieved_docs']
-            }
-            result.update(rouge_scores)
-            results.append(result)
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(dataset)} Natural Questions samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing Natural Questions item {i}: {e}")
-            continue
-    
-    return results
-
-def run_squad_v2_evaluation(tiresrag: TIRESRAGSystem, evaluator: TIRESRAGEvaluator, sample_size: int = 100) -> List[Dict]:
-    """SQuAD v2.0 evaluation with unanswerable questions"""
-    logger.info(f"Running SQuAD v2.0 evaluation ({sample_size} samples)")
-    
-    dataset_options = [
-        ("squad_v2", "validation"),
-        ("rajpurkar/squad_v2", "validation")
-    ]
-    
-    dataset = load_dataset_safe(dataset_options, sample_size)
-    if dataset is None:
-        logger.error("Could not load SQuAD v2.0 dataset")
-        return []
-    
-    results = []
-    for i, item in enumerate(dataset):
-        try:
-            question = item.get('question', '')
-            answers = item.get('answers', {})
-            is_impossible = item.get('is_impossible', False)
-            
-            # Extract answer texts
-            answer_texts = []
-            if not is_impossible and 'text' in answers:
-                answer_texts = answers['text'] if isinstance(answers['text'], list) else [answers['text']]
-            
-            if not question:
-                continue
-                
-            # Get TIRESRAG response
-            response = tiresrag.think_retrieve_reflect(question)
-            
-            # For impossible questions, check if model abstains
-            if is_impossible:
-                abstain_indicators = ['cannot answer', 'no answer', 'impossible', 'insufficient information', 
-                                    'not possible', "don't know", "cannot determine"]
-                abstains = any(indicator in response['text'].lower() for indicator in abstain_indicators)
-                em_score = 1.0 if abstains else 0.0
-                f1_score = 1.0 if abstains else 0.0
+                    dataset = load_dataset(data_type, data_path, split=split)
             else:
-                scores = evaluator.evaluate_against_multiple_answers(response['text'], answer_texts)
-                em_score = scores['em']
-                f1_score = scores['f1']
-            
-            rouge_scores = evaluator.compute_rouge_scores(response['text'], answer_texts[0] if answer_texts else "")
-            
-            result = {
-                'dataset': 'squad_v2',
-                'question': question,
-                'ground_truth': answer_texts,
-                'prediction': response['text'],
-                'thinking': response['thinking'],
-                'is_impossible': is_impossible,
-                'exact_match': em_score,
-                'f1_score': f1_score,
-                'thinking_scores': response['thinking_scores'],
-                'reflection_scores': response['reflection_scores'],
-                'overall_quality': response['overall_quality'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'uses_retrieval': response['uses_retrieval'],
-                'num_retrieved_docs': response['num_retrieved_docs']
-            }
-            result.update(rouge_scores)
-            results.append(result)
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(dataset)} SQuAD v2.0 samples")
-                
+                dataset = load_dataset(dataset_name_or_path, split=split)
         except Exception as e:
-            logger.error(f"Error processing SQuAD v2.0 item {i}: {e}")
-            continue
-    
-    return results
-
-def run_triviaqa_evaluation(tiresrag: TIRESRAGSystem, evaluator: TIRESRAGEvaluator, sample_size: int = 100) -> List[Dict]:
-    """TriviaQA evaluation"""
-    logger.info(f"Running TriviaQA evaluation ({sample_size} samples)")
-    
-    dataset_options = [
-        ("trivia_qa", "rc.nocontext", "validation"),
-        ("trivia_qa", "unfiltered.nocontext", "validation")
-    ]
-    
-    dataset = load_dataset_safe(dataset_options, sample_size)
-    if dataset is None:
-        logger.error("Could not load TriviaQA dataset")
-        return []
-    
-    results = []
-    for i, item in enumerate(dataset):
-        try:
-            question = item.get('question', '')
-            answer = item.get('answer', {})
-            
-            # Extract answer aliases
-            answer_texts = []
-            if 'aliases' in answer:
-                answer_texts = answer['aliases']
-            elif 'value' in answer:
-                answer_texts = [answer['value']]
-            elif isinstance(answer, str):
-                answer_texts = [answer]
-            
-            if not question or not answer_texts:
-                continue
-                
-            # Get TIRESRAG response
-            response = tiresrag.think_retrieve_reflect(question)
-            
-            # Evaluate response
-            scores = evaluator.evaluate_against_multiple_answers(response['text'], answer_texts)
-            rouge_scores = evaluator.compute_rouge_scores(response['text'], answer_texts[0])
-            
-            result = {
-                'dataset': 'triviaqa',
-                'question': question,
-                'ground_truth': answer_texts,
-                'prediction': response['text'],
-                'thinking': response['thinking'],
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'thinking_scores': response['thinking_scores'],
-                'reflection_scores': response['reflection_scores'],
-                'overall_quality': response['overall_quality'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'uses_retrieval': response['uses_retrieval'],
-                'num_retrieved_docs': response['num_retrieved_docs']
-            }
-            result.update(rouge_scores)
-            results.append(result)
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(dataset)} TriviaQA samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing TriviaQA item {i}: {e}")
-            continue
-    
-    return results
-
-def run_fever_evaluation(tiresrag: TIRESRAGSystem, evaluator: TIRESRAGEvaluator, sample_size: int = 100) -> List[Dict]:
-    """FEVER fact verification evaluation"""
-    logger.info(f"Running FEVER evaluation ({sample_size} samples)")
-    
-    dataset_options = [
-        ("fever", "v1.0", "labelled_dev"),
-        ("fever", "v2.0", "validation"),
-        ("AlekseyKorshuk/fever-evidence-related", "validation")
-    ]
-    
-    dataset = load_dataset_safe(dataset_options, sample_size)
-    if dataset is None:
-        logger.error("Could not load FEVER dataset")
-        return []
-    
-    results = []
-    for i, item in enumerate(dataset):
-        try:
-            claim = item.get('claim', '')
-            label = item.get('label', item.get('verdict', ''))
-            evidence = item.get('evidence', [])
-            
-            if not claim or not label:
-                continue
-            
-            # Convert label to standard format
-            if isinstance(label, int):
-                label_map = {0: 'SUPPORTS', 1: 'REFUTES', 2: 'NOT ENOUGH INFO'}
-                label = label_map.get(label, 'NOT ENOUGH INFO')
-            
-            # Format as fact-checking question
-            question = f"Verify this claim: {claim}"
-                
-            # Get TIRESRAG response
-            response = tiresrag.think_retrieve_reflect(question)
-            
-            # Extract predicted label from response
-            pred_label = 'NOT ENOUGH INFO'  # default
-            response_lower = response['text'].lower()
-            if 'support' in response_lower or 'true' in response_lower or 'correct' in response_lower:
-                pred_label = 'SUPPORTS'
-            elif 'refute' in response_lower or 'false' in response_lower or 'incorrect' in response_lower:
-                pred_label = 'REFUTES'
-            
-            # Accuracy for fact verification
-            accuracy = 1.0 if pred_label == label else 0.0
-            
-            # F1 score using label as ground truth
-            f1_score = evaluator.f1_score(pred_label, label)
-            
-            result = {
-                'dataset': 'fever',
-                'question': question,
-                'claim': claim,
-                'ground_truth': label,
-                'prediction': response['text'],
-                'predicted_label': pred_label,
-                'thinking': response['thinking'],
-                'accuracy': accuracy,
-                'exact_match': accuracy,  # For consistency
-                'f1_score': f1_score,
-                'thinking_scores': response['thinking_scores'],
-                'reflection_scores': response['reflection_scores'],
-                'overall_quality': response['overall_quality'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'uses_retrieval': response['uses_retrieval'],
-                'num_retrieved_docs': response['num_retrieved_docs']
-            }
-            results.append(result)
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(dataset)} FEVER samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing FEVER item {i}: {e}")
-            continue
-    
-    return results
-
-def run_ragbench_evaluation(tiresrag: TIRESRAGSystem, evaluator: TIRESRAGEvaluator, sample_size: int = 100) -> List[Dict]:
-    """RAGBench evaluation"""
-    logger.info(f"Running RAGBench evaluation ({sample_size} samples)")
-    
-    dataset_options = [
-        ("chen-alvin/rag-bench", "test"),
-        ("ragbench/ragbench", "test"),
-        ("microsoft/ragbench", "test")
-    ]
-    
-    dataset = load_dataset_safe(dataset_options, sample_size)
-    if dataset is None:
-        logger.error("Could not load RAGBench dataset")
-        return []
-    
-    results = []
-    for i, item in enumerate(dataset):
-        try:
-            question = item.get('question', item.get('query', ''))
-            answer = item.get('answer', item.get('ground_truth', ''))
-            context = item.get('context', item.get('passages', ''))
-            domain = item.get('domain', 'general')
-            
-            if not question or not answer:
-                continue
-                
-            # Get TIRESRAG response
-            response = tiresrag.think_retrieve_reflect(question)
-            
-            # Evaluate response
-            scores = evaluator.evaluate_against_multiple_answers(response['text'], [answer])
-            rouge_scores = evaluator.compute_rouge_scores(response['text'], answer)
-            
-            result = {
-                'dataset': 'ragbench',
-                'question': question,
-                'ground_truth': answer,
-                'prediction': response['text'],
-                'thinking': response['thinking'],
-                'domain': domain,
-                'exact_match': scores['em'],
-                'f1_score': scores['f1'],
-                'thinking_scores': response['thinking_scores'],
-                'reflection_scores': response['reflection_scores'],
-                'overall_quality': response['overall_quality'],
-                'inference_time': response['inference_time'],
-                'tokens_generated': response['tokens_generated'],
-                'uses_retrieval': response['uses_retrieval'],
-                'num_retrieved_docs': response['num_retrieved_docs']
-            }
-            result.update(rouge_scores)
-            results.append(result)
-            
-            if (i + 1) % 10 == 0:
-                logger.info(f"Processed {i + 1}/{len(dataset)} RAGBench samples")
-                
-        except Exception as e:
-            logger.error(f"Error processing RAGBench item {i}: {e}")
-            continue
-    
-    return results
-
-def compute_aggregate_metrics(results: List[Dict]) -> Dict[str, float]:
-    """Compute aggregate metrics across all results"""
-    if not results:
-        return {}
-    
-    metrics = {}
-    
-    # Basic performance metrics
-    em_scores = [r['exact_match'] for r in results if 'exact_match' in r]
-    f1_scores = [r['f1_score'] for r in results if 'f1_score' in r]
-    
-    if em_scores:
-        metrics['avg_exact_match'] = np.mean(em_scores)
-        metrics['std_exact_match'] = np.std(em_scores)
-    
-    if f1_scores:
-        metrics['avg_f1_score'] = np.mean(f1_scores)
-        metrics['std_f1_score'] = np.std(f1_scores)
-    
-    # ROUGE scores if available
-    rouge_metrics = ['rouge1_f', 'rouge2_f', 'rougeL_f']
-    for rouge_metric in rouge_metrics:
-        rouge_scores = [r[rouge_metric] for r in results if rouge_metric in r]
-        if rouge_scores:
-            metrics[f'avg_{rouge_metric}'] = np.mean(rouge_scores)
-            metrics[f'std_{rouge_metric}'] = np.std(rouge_scores)
-    
-    # Performance characteristics
-    inference_times = [r['inference_time'] for r in results if 'inference_time' in r]
-    if inference_times:
-        metrics['avg_inference_time'] = np.mean(inference_times)
-        metrics['median_inference_time'] = np.median(inference_times)
-    
-    tokens_generated = [r['tokens_generated'] for r in results if 'tokens_generated' in r]
-    if tokens_generated:
-        metrics['avg_tokens_generated'] = np.mean(tokens_generated)
-    
-    # Retrieval usage
-    retrieval_usage = [r['uses_retrieval'] for r in results if 'uses_retrieval' in r]
-    if retrieval_usage:
-        metrics['retrieval_usage_rate'] = np.mean(retrieval_usage)
-    
-    # TIRESRAG-specific quality scores
-    thinking_quality = []
-    reflection_quality = []
-    overall_quality = [r['overall_quality'] for r in results if 'overall_quality' in r]
-    
-    for result in results:
-        if 'thinking_scores' in result and result['thinking_scores']:
-            thinking_quality.append(np.mean(list(result['thinking_scores'].values())))
-        if 'reflection_scores' in result and result['reflection_scores']:
-            reflection_quality.append(np.mean(list(result['reflection_scores'].values())))
-    
-    if thinking_quality:
-        metrics['avg_thinking_quality'] = np.mean(thinking_quality)
-        metrics['std_thinking_quality'] = np.std(thinking_quality)
-    
-    if reflection_quality:
-        metrics['avg_reflection_quality'] = np.mean(reflection_quality)
-        metrics['std_reflection_quality'] = np.std(reflection_quality)
-    
-    if overall_quality:
-        metrics['avg_overall_quality'] = np.mean(overall_quality)
-        metrics['std_overall_quality'] = np.std(overall_quality)
-    
-    return metrics
-
-def generate_results_table(all_results: Dict[str, List[Dict]]) -> pd.DataFrame:
-    """Generate comparison table for research paper"""
-    table_data = []
-    
-    for dataset_name, results in all_results.items():
-        if not results:
-            continue
-            
-        metrics = compute_aggregate_metrics(results)
+            logger.error(f"Failed to load dataset: {e}")
+            return {"error": str(e)}
         
-        row = {
-            'Dataset': dataset_name.upper(),
-            'Samples': len(results),
-            'EM': f"{metrics.get('avg_exact_match', 0.0):.3f} ± {metrics.get('std_exact_match', 0.0):.3f}",
-            'F1': f"{metrics.get('avg_f1_score', 0.0):.3f} ± {metrics.get('std_f1_score', 0.0):.3f}",
-            'ROUGE-1': f"{metrics.get('avg_rouge1_f', 0.0):.3f}" if 'avg_rouge1_f' in metrics else "N/A",
-            'ROUGE-L': f"{metrics.get('avg_rougeL_f', 0.0):.3f}" if 'avg_rougeL_f' in metrics else "N/A",
-            'Thinking Quality': f"{metrics.get('avg_thinking_quality', 0.0):.3f}" if 'avg_thinking_quality' in metrics else "N/A",
-            'Reflection Quality': f"{metrics.get('avg_reflection_quality', 0.0):.3f}" if 'avg_reflection_quality' in metrics else "N/A",
-            'Overall Quality': f"{metrics.get('avg_overall_quality', 0.0):.3f}" if 'avg_overall_quality' in metrics else "N/A",
-            'Avg Time (s)': f"{metrics.get('avg_inference_time', 0.0):.2f}" if 'avg_inference_time' in metrics else "N/A",
-            'Retrieval Usage': f"{metrics.get('retrieval_usage_rate', 0.0):.2f}" if 'retrieval_usage_rate' in metrics else "N/A"
+        logger.info(f"Loaded {len(dataset)} samples")
+        
+        # Auto-detect query and answer keys if not provided
+        if not query_key or not answer_key:
+            first_item = dataset[0] if len(dataset) > 0 else {}
+            
+            # Find the most likely query key
+            query_candidates = ["query", "question", "input", "prompt", "context_messages"]
+            if not query_key:
+                for candidate in query_candidates:
+                    if candidate in first_item:
+                        query_key = candidate
+                        break
+                if not query_key and first_item:
+                    logger.warning(f"Could not auto-detect query key. Available keys: {list(first_item.keys())}")
+                    query_key = list(first_item.keys())[0]  # Just use the first key
+            
+            # Find the most likely answer key
+            answer_candidates = ["answer", "output", "response", "ground_truth", "chosen"]
+            if not answer_key:
+                for candidate in answer_candidates:
+                    if candidate in first_item:
+                        answer_key = candidate
+                        break
+                if not answer_key and first_item:
+                    logger.warning(f"Could not auto-detect answer key. Available keys: {list(first_item.keys())}")
+                    answer_key = list(first_item.keys())[-1]  # Just use the last key
+        
+        logger.info(f"Using query_key='{query_key}', answer_key='{answer_key}'")
+        
+        # Limit samples if specified
+        if max_samples and max_samples < len(dataset):
+            dataset = dataset.select(range(max_samples))
+            logger.info(f"Limited to {max_samples} samples")
+        
+        results = []
+        
+        # Process dataset
+        for i, item in tqdm(enumerate(dataset), total=len(dataset), desc="Evaluating"):
+            try:
+                # Extract query and reference answer
+                query = self._extract_field(item, query_key)
+                reference = self._extract_field(item, answer_key)
+                
+                # Skip items without query or reference
+                if not query or not reference:
+                    logger.warning(f"Skipping item {i}: missing query or reference")
+                    continue
+                
+                # Retrieve documents
+                retrieved_docs = self.retrieve_documents(query, top_k=5)
+                
+                # Format context from retrieved documents
+                context = self._format_context(retrieved_docs)
+                
+                if not retrieval_only:
+                    # Generate answer
+                    prediction = self.generate_answer(query, context)
+                    
+                    # Compute reward if available
+                    reward = self.compute_reward(query, prediction, context)
+                    
+                    # Compute metrics
+                    metrics = self.compute_metrics(prediction, reference)
+                    
+                    result = {
+                        "id": i,
+                        "query": query,
+                        "reference": reference,
+                        "prediction": prediction,
+                        "num_retrieved_docs": len(retrieved_docs),
+                        "reward": reward,
+                        **metrics
+                    }
+                else:
+                    # Only evaluate retrieval
+                    result = {
+                        "id": i,
+                        "query": query,
+                        "reference": reference,
+                        "num_retrieved_docs": len(retrieved_docs),
+                        "retrieved_content": context[:200] + "..." if len(context) > 200 else context
+                    }
+                
+                results.append(result)
+                
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {i + 1}/{len(dataset)} samples")
+                    
+            except Exception as e:
+                logger.error(f"Error processing item {i}: {e}")
+                continue
+        
+        # Compute aggregate metrics
+        agg_metrics = {}
+        
+        if not retrieval_only and results:
+            for metric in ["f1", "rouge1", "rouge2", "rougeL", "exact_match", "reward"]:
+                values = [r[metric] for r in results if metric in r]
+                if values:
+                    agg_metrics[f"avg_{metric}"] = sum(values) / len(values)
+                    agg_metrics[f"min_{metric}"] = min(values)
+                    agg_metrics[f"max_{metric}"] = max(values)
+                    agg_metrics[f"std_{metric}"] = np.std(values)
+        
+        return {
+            "results": results,
+            "aggregate_metrics": agg_metrics,
+            "dataset_info": {
+                "name": dataset_name_or_path,
+                "split": split,
+                "num_samples": len(dataset),
+                "num_processed": len(results),
+                "query_key": query_key,
+                "answer_key": answer_key
+            }
         }
-        table_data.append(row)
     
-    return pd.DataFrame(table_data)
-
-def create_performance_plots(all_results: Dict[str, List[Dict]], output_dir: str = "./results"):
-    """Create performance visualization plots"""
-    os.makedirs(output_dir, exist_ok=True)
+    def _extract_field(self, item: Dict, key: str) -> str:
+        """Extract a field from a dataset item, handling complex structures"""
+        if not key or key not in item:
+            return ""
+        
+        value = item[key]
+        
+        # Handle list of messages (like in chat datasets)
+        if isinstance(value, list) and all(isinstance(msg, dict) for msg in value):
+            # Try to extract from chat format
+            text_parts = []
+            for msg in value:
+                if "content" in msg:
+                    text_parts.append(msg["content"])
+            return " ".join(text_parts)
+        
+        # Handle nested dictionaries
+        if isinstance(value, dict):
+            # Try common fields
+            for field in ["text", "content", "value"]:
+                if field in value:
+                    return value[field]
+            # Just concatenate all string values
+            return " ".join(str(v) for v in value.values() if isinstance(v, (str, int, float)))
+        
+        # Handle lists of strings
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return " ".join(value)
+        
+        # Default case
+        return str(value)
     
-    # Set up the plotting style
-    plt.style.use('seaborn-v0_8')
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # 1. F1 Scores by Dataset
-    datasets = []
-    f1_scores = []
-    for dataset_name, results in all_results.items():
-        if results:
-            f1_vals = [r['f1_score'] for r in results if 'f1_score' in r]
-            if f1_vals:
-                datasets.append(dataset_name.upper())
-                f1_scores.append(f1_vals)
-    
-    if datasets and f1_scores:
-        axes[0, 0].boxplot(f1_scores, labels=datasets)
-        axes[0, 0].set_title('F1 Score Distribution by Dataset')
-        axes[0, 0].set_ylabel('F1 Score')
-        axes[0, 0].tick_params(axis='x', rotation=45)
-    
-    # 2. Inference Time Distribution
-    all_times = []
-    dataset_labels = []
-    for dataset_name, results in all_results.items():
-        if results:
-            times = [r['inference_time'] for r in results if 'inference_time' in r and r['inference_time'] > 0]
-            if times:
-                all_times.extend(times)
-                dataset_labels.extend([dataset_name.upper()] * len(times))
-    
-    if all_times:
-        axes[0, 1].hist(all_times, bins=30, alpha=0.7, edgecolor='black')
-        axes[0, 1].set_title('Inference Time Distribution')
-        axes[0, 1].set_xlabel('Inference Time (seconds)')
-        axes[0, 1].set_ylabel('Frequency')
-    
-    # 3. Quality Scores Comparison
-    quality_data = {}
-    for dataset_name, results in all_results.items():
-        if results:
-            thinking_quals = []
-            reflection_quals = []
-            for r in results:
-                if 'thinking_scores' in r and r['thinking_scores']:
-                    thinking_quals.append(np.mean(list(r['thinking_scores'].values())))
-                if 'reflection_scores' in r and r['reflection_scores']:
-                    reflection_quals.append(np.mean(list(r['reflection_scores'].values())))
+    def _format_context(self, docs: List[Dict]) -> str:
+        """Format retrieved documents into a context string"""
+        context_parts = []
+        
+        for i, doc in enumerate(docs):
+            # Extract title and content
+            title = doc.get("title", doc.get("name", f"Document {i+1}"))
+            content = doc.get("content", doc.get("text", ""))
             
-            if thinking_quals and reflection_quals:
-                quality_data[dataset_name.upper()] = {
-                    'thinking': np.mean(thinking_quals),
-                    'reflection': np.mean(reflection_quals)
-                }
-    
-    if quality_data:
-        datasets_q = list(quality_data.keys())
-        thinking_means = [quality_data[d]['thinking'] for d in datasets_q]
-        reflection_means = [quality_data[d]['reflection'] for d in datasets_q]
+            if content:
+                context_parts.append(f"[{title}] {content}")
         
-        x = np.arange(len(datasets_q))
-        width = 0.35
+        return "\n\n".join(context_parts)
+    
+    def evaluate_datasets(self, datasets_config: List[Dict], output_dir: str = "./results") -> Dict:
+        """Evaluate RAG system on multiple datasets"""
+        os.makedirs(output_dir, exist_ok=True)
         
-        axes[1, 0].bar(x - width/2, thinking_means, width, label='Thinking Quality', alpha=0.8)
-        axes[1, 0].bar(x + width/2, reflection_means, width, label='Reflection Quality', alpha=0.8)
-        axes[1, 0].set_title('Quality Scores by Dataset')
-        axes[1, 0].set_ylabel('Quality Score')
-        axes[1, 0].set_xticks(x)
-        axes[1, 0].set_xticklabels(datasets_q, rotation=45)
-        axes[1, 0].legend()
-    
-    # 4. Retrieval Usage Analysis
-    retrieval_stats = {}
-    for dataset_name, results in all_results.items():
-        if results:
-            retrieval_usage = [r['uses_retrieval'] for r in results if 'uses_retrieval' in r]
-            if retrieval_usage:
-                retrieval_stats[dataset_name.upper()] = np.mean(retrieval_usage)
-    
-    if retrieval_stats:
-        datasets_r = list(retrieval_stats.keys())
-        usage_rates = list(retrieval_stats.values())
+        all_results = {}
         
-        axes[1, 1].bar(datasets_r, usage_rates, alpha=0.8, color='skyblue', edgecolor='navy')
-        axes[1, 1].set_title('Retrieval Usage Rate by Dataset')
-        axes[1, 1].set_ylabel('Usage Rate')
-        axes[1, 1].tick_params(axis='x', rotation=45)
-        axes[1, 1].set_ylim(0, 1)
+        for config in datasets_config:
+            dataset_name = config.get("name")
+            split = config.get("split", "test")
+            max_samples = config.get("max_samples")
+            retrieval_only = config.get("retrieval_only", False)
+            query_key = config.get("query_key")
+            answer_key = config.get("answer_key")
+            
+            logger.info(f"Evaluating dataset {dataset_name}, split {split}")
+            
+            result = self.evaluate_dataset(
+                dataset_name_or_path=dataset_name,
+                split=split,
+                max_samples=max_samples,
+                retrieval_only=retrieval_only,
+                query_key=query_key,
+                answer_key=answer_key
+            )
+            
+            all_results[dataset_name] = result
+            
+            # Save individual dataset results
+            dataset_filename = dataset_name.replace("/", "_").replace("@", "_")
+            with open(f"{output_dir}/{dataset_filename}_results.json", "w") as f:
+                json.dump(result, f, indent=2)
+        
+        # Generate comparison table
+        comparison_table = self._generate_comparison_table(all_results)
+        comparison_table.to_csv(f"{output_dir}/comparison_table.csv", index=False)
+        
+        # Generate plots
+        self._generate_plots(all_results, output_dir)
+        
+        logger.info(f"Evaluation complete. Results saved to {output_dir}")
+        
+        return all_results
     
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/tiresrag_performance_analysis.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    def _generate_comparison_table(self, all_results: Dict) -> pd.DataFrame:
+        """Generate comparison table for all datasets"""
+        table_data = []
+        
+        for dataset_name, result in all_results.items():
+            if "aggregate_metrics" not in result or not result["aggregate_metrics"]:
+                continue
+                
+            metrics = result["aggregate_metrics"]
+            dataset_info = result["dataset_info"]
+            
+            row = {
+                "Dataset": dataset_name,
+                "Samples": dataset_info["num_processed"],
+                "F1 Score": f"{metrics.get('avg_f1', 0.0):.3f} ± {metrics.get('std_f1', 0.0):.3f}",
+                "ROUGE-1": f"{metrics.get('avg_rouge1', 0.0):.3f}",
+                "ROUGE-L": f"{metrics.get('avg_rougeL', 0.0):.3f}",
+                "Exact Match": f"{metrics.get('avg_exact_match', 0.0):.3f}",
+                "Reward": f"{metrics.get('avg_reward', 0.0):.3f}" if 'avg_reward' in metrics else "N/A"
+            }
+            table_data.append(row)
+        
+        return pd.DataFrame(table_data)
     
-    logger.info(f"Performance plots saved to {output_dir}/tiresrag_performance_analysis.png")
+    def _generate_plots(self, all_results: Dict, output_dir: str):
+        """Generate performance visualization plots"""
+        plt.style.use('seaborn-v0_8')
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. F1 Scores by Dataset
+        datasets = []
+        f1_scores = []
+        
+        for dataset_name, result in all_results.items():
+            if "results" not in result or not result["results"]:
+                continue
+                
+            f1_vals = [r.get("f1", 0.0) for r in result["results"] if "f1" in r]
+            if f1_vals:
+                datasets.append(dataset_name)
+                f1_scores.append(f1_vals)
+        
+        if datasets and f1_scores:
+            axes[0, 0].boxplot(f1_scores, labels=datasets)
+            axes[0, 0].set_title('F1 Score Distribution by Dataset')
+            axes[0, 0].set_ylabel('F1 Score')
+            axes[0, 0].tick_params(axis='x', rotation=45)
+        
+        # 2. ROUGE Scores Comparison
+        if datasets:
+            rouge1_means = []
+            rouge2_means = []
+            rougeL_means = []
+            
+            for dataset_name, result in all_results.items():
+                if "aggregate_metrics" not in result or not result["aggregate_metrics"]:
+                    continue
+                    
+                metrics = result["aggregate_metrics"]
+                rouge1_means.append(metrics.get("avg_rouge1", 0.0))
+                rouge2_means.append(metrics.get("avg_rouge2", 0.0))
+                rougeL_means.append(metrics.get("avg_rougeL", 0.0))
+            
+            x = np.arange(len(datasets))
+            width = 0.25
+            
+            if x.size > 0:  # Check if there are datasets to plot
+                axes[0, 1].bar(x - width, rouge1_means, width, label='ROUGE-1')
+                axes[0, 1].bar(x, rouge2_means, width, label='ROUGE-2')
+                axes[0, 1].bar(x + width, rougeL_means, width, label='ROUGE-L')
+                axes[0, 1].set_title('ROUGE Scores by Dataset')
+                axes[0, 1].set_ylabel('Score')
+                axes[0, 1].set_xticks(x)
+                axes[0, 1].set_xticklabels(datasets, rotation=45)
+                axes[0, 1].legend()
+        
+        # 3. Exact Match Rates
+        if datasets:
+            exact_match_rates = []
+            
+            for dataset_name, result in all_results.items():
+                if "aggregate_metrics" not in result or not result["aggregate_metrics"]:
+                    continue
+                    
+                metrics = result["aggregate_metrics"]
+                exact_match_rates.append(metrics.get("avg_exact_match", 0.0))
+            
+            axes[1, 0].bar(datasets, exact_match_rates, alpha=0.8)
+            axes[1, 0].set_title('Exact Match Rate by Dataset')
+            axes[1, 0].set_ylabel('Rate')
+            axes[1, 0].tick_params(axis='x', rotation=45)
+        
+        # 4. Reward Distribution
+        all_rewards = []
+        dataset_labels = []
+        
+        for dataset_name, result in all_results.items():
+            if "results" not in result or not result["results"]:
+                continue
+                
+            rewards = [r.get("reward", 0.0) for r in result["results"] if "reward" in r]
+            if rewards:
+                all_rewards.extend(rewards)
+                dataset_labels.extend([dataset_name] * len(rewards))
+        
+        if all_rewards:
+            axes[1, 1].hist(all_rewards, bins=20, alpha=0.7, edgecolor='black')
+            axes[1, 1].set_title('Reward Distribution')
+            axes[1, 1].set_xlabel('Reward')
+            axes[1, 1].set_ylabel('Frequency')
+        
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/rag_performance_analysis.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Performance plots saved to {output_dir}/rag_performance_analysis.png")
 
-def run_comprehensive_evaluation(sample_size: int = 100, output_dir: str = "./tiresrag_results"):
-    """Run comprehensive evaluation across all datasets"""
-    logger.info("Starting TIRESRAG-R1 Comprehensive Evaluation")
-    logger.info(f"Sample size per dataset: {sample_size}")
-    
-    # Initialize system
-    tiresrag = TIRESRAGSystem()
-    evaluator = TIRESRAGEvaluator()
-    
-    # Setup services (optional - will use fallbacks if not available)
-    tiresrag.setup_services()
-    
-    # Run evaluations
-    all_results = {}
-    evaluation_functions = {
-        'hotpotqa': run_hotpotqa_evaluation,
-        'natural_questions': run_natural_questions_evaluation,
-        'squad_v2': run_squad_v2_evaluation,
-        'triviaqa': run_triviaqa_evaluation,
-        'fever': run_fever_evaluation,
-        'ragbench': run_ragbench_evaluation
+def get_dataset_config(dataset_name: str) -> Dict:
+    """Get dataset-specific configuration based on known datasets"""
+    # Dictionary of known dataset configurations
+    dataset_configs = {
+        "microsoft/ms_marco": {
+            "config": "v2.1",
+            "split": "dev",
+            "query_key": "query",
+            "answer_key": "answers"
+        },
+        "mwong/fever-evidence-related": {
+            "split": "validation",
+            "query_key": "claim", 
+            "answer_key": "label"
+        },
+        "wandb/RAGTruth-processed": {
+            "split": "train",
+            "query_key": "question",
+            "answer_key": "answer"
+        },
+        "hotpot_qa": {
+            "config": "distractor",
+            "split": "validation",
+            "query_key": "question",
+            "answer_key": "answer"
+        },
+        "squad_v2": {
+            "split": "validation",
+            "query_key": "question",
+            "answer_key": "answers"
+        },
+        "trivia_qa": {
+            "config": "rc.nocontext",
+            "split": "validation",
+            "query_key": "question", 
+            "answer_key": "answer"
+        },
+        "natural_questions": {
+            "split": "validation",
+            "query_key": "question",
+            "answer_key": "annotations"
+        }
     }
     
-    start_time = time.time()
+    # Extract base dataset name (without config or version)
+    base_name = dataset_name.split("/")[-1].split("@")[0]
     
-    for dataset_name, eval_func in evaluation_functions.items():
-        logger.info(f"Running {dataset_name} evaluation...")
-        try:
-            results = eval_func(tiresrag, evaluator, sample_size)
-            all_results[dataset_name] = results
-            logger.info(f"Completed {dataset_name}: {len(results)} samples processed")
-        except Exception as e:
-            logger.error(f"Failed {dataset_name} evaluation: {e}")
-            all_results[dataset_name] = []
+    # Find matching configuration
+    for key, config in dataset_configs.items():
+        if base_name in key or key in dataset_name:
+            return config
     
-    total_time = time.time() - start_time
-    logger.info(f"Total evaluation time: {total_time:.2f} seconds")
-    
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Generate results table
-    results_table = generate_results_table(all_results)
-    
-    # Save results
-    results_table.to_csv(f"{output_dir}/tiresrag_results_table.csv", index=False)
-    logger.info(f"Results table saved to {output_dir}/tiresrag_results_table.csv")
-    
-    # Save detailed results
-    with open(f"{output_dir}/tiresrag_detailed_results.json", 'w') as f:
-        # Convert results to JSON-serializable format
-        json_results = {}
-        for dataset, results in all_results.items():
-            json_results[dataset] = []
-            for result in results:
-                json_result = {}
-                for key, value in result.items():
-                    if isinstance(value, (int, float, str, bool, list)):
-                        json_result[key] = value
-                    else:
-                        json_result[key] = str(value)
-                json_results[dataset].append(json_result)
-        
-        json.dump(json_results, f, indent=2)
-    
-    logger.info(f"Detailed results saved to {output_dir}/tiresrag_detailed_results.json")
-    
-    # Create performance plots
-    create_performance_plots(all_results, output_dir)
-    
-    # Print summary
-    print("\n" + "="*60)
-    print("TIRESRAG-R1 EVALUATION SUMMARY")
-    print("="*60)
-    print(results_table.to_string(index=False))
-    print("="*60)
-    
-    # Compute overall statistics
-    total_samples = sum(len(results) for results in all_results.values())
-    successful_datasets = len([d for d, r in all_results.items() if r])
-    
-    print(f"\nTotal samples processed: {total_samples}")
-    print(f"Successful datasets: {successful_datasets}/6")
-    print(f"Total evaluation time: {total_time:.2f} seconds")
-    print(f"Average time per sample: {total_time/max(total_samples, 1):.2f} seconds")
-    
-    return all_results, results_table
+    # Default configuration
+    return {
+        "split": "test",
+        "query_key": None,  # Auto-detect
+        "answer_key": None  # Auto-detect
+    }
 
-if __name__ == "__main__":
-    import argparse
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate RAG systems with OpenRLHF")
     
-    parser = argparse.ArgumentParser(description="TIRESRAG-R1 Comprehensive Evaluation")
-    parser.add_argument("--sample_size", type=int, default=100, 
-                       help="Number of samples per dataset (default: 100)")
-    parser.add_argument("--output_dir", type=str, default="./tiresrag_results",
-                       help="Output directory for results (default: ./tiresrag_results)")
-    parser.add_argument("--model_name", type=str, default="TIRESRAG-R1-Instruct",
-                       help="TIRESRAG model name or path")
+    # Model and reward model parameters
+    parser.add_argument("--model_name", type=str, required=True,
+                        help="Name or path of the LLM to use")
+    parser.add_argument("--reward_model_path", type=str,
+                        help="Path to reward model (optional)")
+                        
+    # Retriever parameters
+    parser.add_argument("--retriever_type", type=str, default="mock",
+                        choices=["faiss", "es", "chroma", "mock"],
+                        help="Type of retriever to use (default: mock)")
+    parser.add_argument("--faiss_index_path", type=str,
+                        help="Path to FAISS index (for faiss retriever)")
+    parser.add_argument("--document_path", type=str,
+                        help="Path to documents (JSON/JSONL) for retrieval")
+                        
+    # Dataset parameters
+    parser.add_argument("--datasets", type=str, required=True,
+                        help="Comma-separated list of datasets to evaluate (e.g., 'microsoft/ms_marco,hotpot_qa')")
+    parser.add_argument("--splits", type=str,
+                        help="Comma-separated list of dataset splits (default: auto-detect per dataset)")
+    parser.add_argument("--max_samples", type=int, default=100,
+                        help="Maximum number of samples per dataset (default: 100)")
+    parser.add_argument("--query_keys", type=str,
+                        help="Comma-separated list of query keys (default: auto-detect per dataset)")
+    parser.add_argument("--answer_keys", type=str,
+                        help="Comma-separated list of answer keys (default: auto-detect per dataset)")
+                        
+    # Evaluation parameters
+    parser.add_argument("--output_dir", type=str, default="./rag_results",
+                        help="Output directory for results (default: ./rag_results)")
+    parser.add_argument("--retrieval_only", action="store_true",
+                        help="Evaluate only retrieval without generation")
+    parser.add_argument("--max_length", type=int, default=2048,
+                        help="Maximum sequence length (default: 2048)")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Batch size for generation (default: 8)")
+                        
+    # Generation parameters
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Temperature for generation (default: 0.7)")
+    parser.add_argument("--max_new_tokens", type=int, default=1024,
+                        help="Maximum new tokens to generate (default: 1024)")
     
     args = parser.parse_args()
     
-    # Run evaluation
-    all_results, results_table = run_comprehensive_evaluation(
-        sample_size=args.sample_size,
-        output_dir=args.output_dir
+    # Parse datasets
+    datasets = [ds.strip() for ds in args.datasets.split(",")]
+    
+    # Create retriever parameters
+    retriever_params = {}
+    if args.retriever_type == "faiss" and args.faiss_index_path:
+        retriever_params["index_path"] = args.faiss_index_path
+        
+        # Load documents if available
+        if args.document_path:
+            try:
+                if args.document_path.endswith(".json"):
+                    with open(args.document_path, "r") as f:
+                        documents = json.load(f)
+                elif args.document_path.endswith(".jsonl"):
+                    documents = []
+                    with open(args.document_path, "r") as f:
+                        for line in f:
+                            documents.append(json.loads(line))
+                else:
+                    logger.warning(f"Unsupported document format: {args.document_path}")
+                    documents = []
+                
+                retriever_params["documents"] = documents
+                logger.info(f"Loaded {len(documents)} documents from {args.document_path}")
+            except Exception as e:
+                logger.error(f"Error loading documents: {e}")
+    
+    # Prepare generation config
+    generation_config = {
+        "temperature": args.temperature,
+        "max_new_tokens": args.max_new_tokens
+    }
+    
+    # Initialize evaluator
+    evaluator = RAGEvaluator(
+        model_name=args.model_name,
+        retriever_type=args.retriever_type,
+        retriever_params=retriever_params,
+        reward_model_path=args.reward_model_path,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        generation_config=generation_config
     )
+    
+    # Create dataset configurations
+    datasets_config = []
+    
+    # Parse optional parameters
+    splits = args.splits.split(",") if args.splits else []
+    query_keys = args.query_keys.split(",") if args.query_keys else []
+    answer_keys = args.answer_keys.split(",") if args.answer_keys else []
+    
+    # Ensure lists have the right length
+    if splits and len(splits) == 1 and len(datasets) > 1:
+        splits = splits * len(datasets)
+    if query_keys and len(query_keys) == 1 and len(datasets) > 1:
+        query_keys = query_keys * len(datasets)
+    if answer_keys and len(answer_keys) == 1 and len(datasets) > 1:
+        answer_keys = answer_keys * len(datasets)
+    
+    # Build dataset configurations
+    for i, dataset in enumerate(datasets):
+        # Get default configuration for this dataset
+        config = get_dataset_config(dataset)
+        
+        # Override with command-line arguments if provided
+        if splits and i < len(splits):
+            config["split"] = splits[i]
+        if query_keys and i < len(query_keys):
+            config["query_key"] = query_keys[i]
+        if answer_keys and i < len(answer_keys):
+            config["answer_key"] = answer_keys[i]
+        
+        # Create the final configuration
+        dataset_config = {
+            "name": dataset,
+            "split": config["split"],
+            "query_key": config["query_key"],
+            "answer_key": config["answer_key"],
+            "max_samples": args.max_samples,
+            "retrieval_only": args.retrieval_only
+        }
+        
+        datasets_config.append(dataset_config)
+    
+    # Run evaluation
+    evaluator.evaluate_datasets(datasets_config, output_dir=args.output_dir)
+
+if __name__ == "__main__":
+    main()
